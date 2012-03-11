@@ -1,24 +1,71 @@
 module exent.httpserver;
 
 import std.concurrency;
+import std.conv;
 import std.socket;
 import std.stdio;
 import std.string;
 
 import core.thread; // TODO: remove this along with main()
 
+public:
 shared class HttpRequestHandler {
-	HttpMessage handle(HttpMessage request) {
+public:
+	void setStaticResponse(string path, HttpMessage response) {
+		staticResponses[path] = response;
+	}
+
+protected:
+	HttpMessage handleDynamicRequest(HttpMessageRequest request) {
 		HttpMessage response;
 		response.startLine = "HTTP/1.1 200 OK";
 		response.content = "It works!";
+		response.header = "Content-Length: " ~ to!string(response.content.length);
 		return response;
 	}
 
 	HttpMessage handleBadRequest() {
 		HttpMessage response;
+		response.startLine = "HTTP/1.1 400 Bad Request";
 		response.content = "400 - Bad Request";
+		response.header = "Content-Length: " ~ to!string(response.content.length);
 		return response;
+	}
+
+	HttpMessage handleNotFound() {
+		HttpMessage response;
+		response.startLine = "HTTP/1.1 404 Not Found";
+		response.content = "404 - Not Found";
+		response.header = "Content-Length: " ~ to!string(response.content.length);
+		return response;
+	}
+
+	HttpMessage handleNotImplemented() {
+		HttpMessage response;
+		response.startLine = "HTTP/1.1 501 Not Implemented";
+		response.content = "501 - Not Implemented";
+		response.header = "Content-Length: " ~ to!string(response.content.length);
+		return response;
+	}
+
+private:
+	HttpMessage[string] staticResponses;
+
+	HttpMessage handle(HttpMessage httpMessage) {
+		HttpMessageRequest request = parseRequest(httpMessage);
+		if (request.method == "ERROR")
+			return handleBadRequest();
+		if (request.method != "GET")
+			return handleNotImplemented();
+		if (request.path in staticResponses)
+			return staticResponses[request.path];
+		return handleDynamicRequest(request);
+	}
+
+	HttpMessageRequest parseRequest(HttpMessage request) {
+		string[] entries = split(request.startLine);
+		long pos = indexOf(entries[1], '?');
+		return HttpMessageRequest(entries[0], entries[1][0 .. pos], entries[1][pos + 1 .. $], entries[2], request);
 	}
 }
 
@@ -26,6 +73,15 @@ struct HttpMessage {
 	string startLine;
 	string header;
 	string content;
+}
+
+struct HttpMessageRequest {
+	string method;
+	string path;
+	string query;
+	string protocol;
+	HttpMessage httpMessage;
+	alias httpMessage this;
 }
 
 struct ServerSettings {
@@ -40,7 +96,7 @@ bool startServer(shared HttpRequestHandler handler, ServerSettings settings) {
 		/* already a listener for this port */
 		return false;
 	}
-	listeners[settings.port] = spawn(&listen2, handler, settings);
+	listeners[settings.port] = spawn(&listen, handler, settings);
 	return true;
 }
 
@@ -51,90 +107,9 @@ void main() {
 }
 
 private:
-struct Connection {
-	int id;
-	Socket socket;
-	char[] readBuffer;
-	char[] writeBuffer;
-}
-
 Tid[ushort] listeners;
 
-void listen(HttpRequestHandler handler, ServerSettings settings) {
-	Socket listener = new TcpSocket;
-	scope (exit) {
-		listener.shutdown(SocketShutdown.BOTH);
-		listener.close();
-	}
-	listener.blocking = false;
-	listener.bind(new InternetAddress(settings.port));
-	listener.listen(settings.connectionQueueSize);
-	SocketSet readSet = new SocketSet(settings.maxConnections + 1);
-	Connection[] connections;
-	int connectionId = 0;
-	bool active = true;
-	while (active) {
-		readSet.reset();
-		readSet.add(listener);
-		int tempConnectionId;
-		char[] tempWriteBuffer;
-		receiveTimeout(dur!"usecs"(1), (int connectionId, char[] writeBuffer) { tempConnectionId = connectionId; tempWriteBuffer = writeBuffer; });
-		foreach (connection; connections) {
-			if (connection.id == tempConnectionId)
-				connection.writeBuffer = tempWriteBuffer;
-			readSet.add(connection.socket);
-		}
-		if (Socket.select(readSet, null, null, 10000) > 0) {
-			/* Socket.select() will remove all sockets from the set except the changed ones */
-			if (readSet.isSet(listener)) {
-				/* listener is in set, this means someone is contacting us */
-				Socket socket = listener.accept();
-				if (connections.length < settings.maxConnections) {
-					/* we got room for another connection */
-					writefln("Connection from %s established", socket.remoteAddress());
-					connections ~= Connection(++connectionId, socket, [], []);
-				} else {
-					/* too many connections, refuse a new connection */
-					writefln("Connection from %s dropped, too many connections", socket.remoteAddress());
-					socket.close();
-				}
-			}
-			int index = 0;
-			while (index < connections.length) {
-				/* any news from the established connections? */
-				if (readSet.isSet(connections[index].socket)) {
-					/* someone sent us a letter, let's read it */
-					writefln("Socket is ready for reading: %s", connections[index].socket);
-					char[4096] buffer;
-					long result = connections[index].socket.receive(buffer);
-					switch (result) {
-					case Socket.ERROR:
-						writeln("Connection error");
-						/* fallthrough */
-
-					case 0:
-						writeln("Connection closed");
-						connections[index].socket.close();
-						if (index < connections.length)
-							connections[index] = connections[$ - 1];
-						connections = connections[0 .. $ - 1];
-						continue; // skip incrementing index
-
-					default:
-						writefln("Received %s bytes from %s: %s", result, connections[index].socket.remoteAddress(), buffer[0 .. result]);
-						connections[index].readBuffer ~= buffer[0 .. result];
-						break;
-					}
-				}
-				++index;
-			}
-		}
-		receiveTimeout(dur!"usecs"(1), (OwnerTerminated) { active = false; }); 
-	}
-}
-
-/* sigh */
-void listen2(shared HttpRequestHandler handler, ServerSettings settings) {
+void listen(shared HttpRequestHandler handler, ServerSettings settings) {
 	Socket listener = new TcpSocket;
 	scope (exit) {
 		listener.shutdown(SocketShutdown.BOTH);
@@ -143,22 +118,29 @@ void listen2(shared HttpRequestHandler handler, ServerSettings settings) {
 	listener.blocking = true;
 	listener.bind(new InternetAddress(settings.port));
 	listener.listen(settings.connectionQueueSize);
+	int threads = 0;
 	bool active = true;
 	while (active) {
-		spawn(&handle, handler, cast(shared) listener.accept());
+		if (threads >= settings.maxConnections) {
+			// TODO: receive(... { --threads; })
+		}
+		spawn(&handle, handler, settings, cast(shared) listener.accept());
+		++threads;
+		// TODO: while (something) receiveTimeout(dur!"usecs"(1), ... { --threads; });
 		writeln("listener.accept() stopped blocking");
 		receiveTimeout(dur!"usecs"(1), (OwnerTerminated) { active = false; }); 
 	}
 }
 
-void handle(shared HttpRequestHandler handler, shared Socket ssocket) {
+void handle(shared HttpRequestHandler handler, ServerSettings settings, shared Socket ssocket) {
 	Socket socket = cast(Socket) ssocket; // nice, eh?
 	scope (exit) {
+		// TODO: send()
 		socket.shutdown(SocketShutdown.BOTH);
 		socket.close();
 	}
-	socket.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"seconds"(5));
-	socket.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, dur!"seconds"(5));
+	socket.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(settings.connectionTimeoutMs));
+	socket.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, dur!"msecs"(settings.connectionTimeoutMs));
 	HttpMessage request;
 	int status = 0;
 	while (status == 0) {
@@ -225,6 +207,7 @@ void handle(shared HttpRequestHandler handler, shared Socket ssocket) {
 	buffer ~= response.header;
 	buffer ~= [13, 10, 13, 10];
 	buffer ~= response.content;
+	writefln("Sending to client: %s", buffer);
 	bool active = true;
 	while (active) {
 		long sent = socket.send(buffer);
