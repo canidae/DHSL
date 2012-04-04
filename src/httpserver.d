@@ -2,6 +2,7 @@ module exent.httpserver;
 
 import std.concurrency;
 import std.conv;
+import std.file;
 import std.socket;
 import std.stdio;
 import std.string;
@@ -40,25 +41,23 @@ shared interface HttpRequestHandler {
 	HttpMessage handle(HttpMessageRequest request, Address local, Address remote);
 }
 
-shared class DefaultHttpRequestHandler : HttpRequestHandler {
-protected:
-	override HttpMessage handle(HttpMessageRequest request, Address local, Address remote) {
-		HttpMessage response;
-		response.startLine = "HTTP/1.1 200 OK";
-		response.content = "This is the default handler for requests that were handled correctly. If you see this message it means no handler was defined to handle the requested path.\n\n";
-		response.content ~= "Request details:\n";
-		response.content ~= "Method: " ~ request.method ~ "\n";
-		response.content ~= "Path: " ~ request.path ~ "\n";
-		response.content ~= "Query: " ~ request.query ~ "\n";
-		response.content ~= "Protocol: " ~ request.protocol ~ "\n";
-		response.content ~= "Header: " ~ request.header ~ "\n";
-		response.content ~= "Content: " ~ request.content ~ "\n\n";
-		response.content ~= "Local address: " ~ local.toString() ~ "\n";
-		response.content ~= "Remote address: " ~ remote.toString();
-		response.header = "Content-Length: " ~ to!string(response.content.length);
-		return response;
+shared class StaticHttpRequestHandler : HttpRequestHandler {
+public:
+	this(HttpMessage response) {
+		this.response = response;
 	}
 
+protected:
+	HttpMessage response;
+
+	override HttpMessage handle(HttpMessageRequest, Address local, Address remote) {
+		writeln("Static handler");
+		return response;
+	}
+}
+
+shared class HttpRequestErrorHandler {
+protected:
 	HttpMessage handleError(int errorCode, HttpMessage request, Address local, Address remote) {
 		HttpMessage response;
 		switch (errorCode) {
@@ -69,7 +68,16 @@ protected:
 
 		case NOT_FOUND:
 			response.startLine = "HTTP/1.1 404 Not Found";
-			response.content = "404 - Not Found";
+			response.content = "The requested resource was not found.\n\n";
+			response.content ~= "Request details:\n";
+			response.content ~= "Method: " ~ request.method ~ "\n";
+			response.content ~= "Path: " ~ request.path ~ "\n";
+			response.content ~= "Query: " ~ request.query ~ "\n";
+			response.content ~= "Protocol: " ~ request.protocol ~ "\n";
+			response.content ~= "Header: " ~ request.header ~ "\n";
+			response.content ~= "Content: " ~ request.content ~ "\n\n";
+			response.content ~= "Local address: " ~ local.toString() ~ "\n";
+			response.content ~= "Remote address: " ~ remote.toString();
 			break;
 
 		case NOT_IMPLEMENTED:
@@ -89,9 +97,9 @@ protected:
 
 shared class HttpServer {
 public:
-	this(ServerSettings settings, shared DefaultHttpRequestHandler defaultHandler = new DefaultHttpRequestHandler()) {
+	this(ServerSettings settings, shared HttpRequestErrorHandler errorHandler = new HttpRequestErrorHandler()) {
 		this.settings = cast(shared) settings; // XXX: does shared struct even make any sense?
-		this.defaultHandler = defaultHandler;
+		this.errorHandler = errorHandler;
 		listenerThread = cast(shared) spawn(&listen, this);
 	}
 
@@ -103,12 +111,30 @@ private:
 	Tid listenerThread;
 	ServerSettings settings;
 	HttpRequestHandler[string] handlers;
-	DefaultHttpRequestHandler defaultHandler;
+	HttpRequestErrorHandler errorHandler;
+}
+
+void addStaticResponses(HttpServer server, string path) {
+	if (server is null || path is null)
+		return;
+	writeln("Reading files from: " ~ path);
+	foreach (DirEntry f; dirEntries(path, SpanMode.depth)) {
+		if (f.name[$ - 4 .. $] == ".swp")
+			continue;
+		string serverPath = f.name[path.length .. $];
+		writeln("Adding static response to path: " ~ serverPath);
+		HttpMessage response;
+		response.startLine = "HTTP/1.1 200 OK";
+		response.content = readText(f.name);
+		response.header = "Content-Length: " ~ to!string(response.content.length);
+		server.addHandler(serverPath, new StaticHttpRequestHandler(response));
+	}
 }
 
 /* TODO: temporary for testing, remove */
 void main() {
-	HttpServer httpServer = new HttpServer(ServerSettings());
+	HttpServer server = new HttpServer(ServerSettings());
+	addStaticResponses(server, "/home/canidae/projects/dhsl/src");
 	Thread.sleep(dur!"seconds"(10));
 }
 
@@ -205,15 +231,13 @@ void handle(shared HttpServer server, shared Socket ssocket) {
 		else if (parsedRequest.method != "GET")
 			status = NOT_IMPLEMENTED;
 	}
-	if (status == STATUS_OK) {
-		shared HttpRequestHandler handler;
-		if (parsedRequest.path in server.handlers)
-			handler = server.handlers[parsedRequest.path];
-		else
-			handler = server.defaultHandler;
+	if (status == STATUS_OK && parsedRequest.path in server.handlers) {
+		shared HttpRequestHandler handler = server.handlers[parsedRequest.path];
 		response = handler.handle(parsedRequest, socket.localAddress(), socket.remoteAddress());
 	} else {
-		server.defaultHandler.handleError(status, request, socket.localAddress(), socket.remoteAddress());
+		if (status == STATUS_OK)
+			status = NOT_FOUND;
+		response = server.errorHandler.handleError(status, request, socket.localAddress(), socket.remoteAddress());
 	}
 	char[] buffer;
 	buffer ~= response.startLine;
@@ -235,5 +259,8 @@ void handle(shared HttpServer server, shared Socket ssocket) {
 HttpMessageRequest parseRequest(HttpMessage request) {
 	string[] entries = split(request.startLine);
 	long pos = indexOf(entries[1], '?');
-	return HttpMessageRequest(entries[0], entries[1][0 .. pos], entries[1][pos + 1 .. $], entries[2], request);
+	if (pos >= 0)
+		return HttpMessageRequest(entries[0], entries[1][0 .. pos], entries[1][pos .. $], entries[2], request);
+	else
+		return HttpMessageRequest(entries[0], entries[1], "", entries[2], request);
 }
