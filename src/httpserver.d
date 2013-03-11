@@ -2,6 +2,7 @@ module exent.httpserver;
 
 import std.concurrency;
 import std.conv;
+import std.datetime;
 import std.file;
 import std.socket;
 import std.stdio;
@@ -9,7 +10,6 @@ import std.string;
 
 import core.thread; // TODO: remove this along with main()
 
-public:
 immutable int STATUS_OK = 200;
 immutable int BAD_REQUEST = 400;
 immutable int NOT_FOUND = 404;
@@ -32,7 +32,7 @@ struct HttpMessageRequest {
 
 struct ServerSettings {
 	ushort port = 8080;
-	int maxConnections = 100;
+	int maxConnections = 2;
 	int connectionQueueSize = 10;
 	int connectionTimeoutMs = 60000;
 }
@@ -42,9 +42,19 @@ shared interface HttpRequestHandler {
 }
 
 shared class StaticHttpRequestHandler : HttpRequestHandler {
-public:
 	this(HttpMessage response) {
 		this.response = response;
+	}
+
+	this(string content) {
+		string header = "Content-Length: " ~ to!string(content.length);
+		this(header, content);
+	}
+
+	this(string header, string content) {
+		response.startLine = "HTTP/1.1 200 OK";
+		response.header = header;
+		response.content = content;
 	}
 
 protected:
@@ -70,10 +80,7 @@ protected:
 			response.startLine = "HTTP/1.1 404 Not Found";
 			response.content = "The requested resource was not found.\n\n";
 			response.content ~= "Request details:\n";
-			response.content ~= "Method: " ~ request.method ~ "\n";
-			response.content ~= "Path: " ~ request.path ~ "\n";
-			response.content ~= "Query: " ~ request.query ~ "\n";
-			response.content ~= "Protocol: " ~ request.protocol ~ "\n";
+			response.content ~= "Start line: " ~ request.startLine ~ "\n";
 			response.content ~= "Header: " ~ request.header ~ "\n";
 			response.content ~= "Content: " ~ request.content ~ "\n\n";
 			response.content ~= "Local address: " ~ local.toString() ~ "\n";
@@ -96,11 +103,10 @@ protected:
 }
 
 shared class HttpServer {
-public:
 	this(ServerSettings settings, shared HttpRequestErrorHandler errorHandler = new HttpRequestErrorHandler()) {
 		this.settings = cast(shared) settings; // XXX: does shared struct even make any sense?
 		this.errorHandler = errorHandler;
-		listenerThread = cast(shared) spawn(&listen, this);
+		//listenerThread = cast(shared) spawn(&listenOld, this);
 	}
 
 	void addHandler(string path, shared HttpRequestHandler handler) {
@@ -123,11 +129,7 @@ void addStaticResponses(HttpServer server, string path) {
 			continue;
 		string serverPath = f.name[path.length .. $];
 		writeln("Adding static response to path: " ~ serverPath);
-		HttpMessage response;
-		response.startLine = "HTTP/1.1 200 OK";
-		response.content = readText(f.name);
-		response.header = "Content-Length: " ~ to!string(response.content.length);
-		server.addHandler(serverPath, new StaticHttpRequestHandler(response));
+		//server.addHandler(serverPath, new StaticHttpRequestHandler(readText(f.name)));
 	}
 }
 
@@ -135,12 +137,95 @@ void addStaticResponses(HttpServer server, string path) {
 void main() {
 	HttpServer server = new HttpServer(ServerSettings());
 	addStaticResponses(server, "/home/canidae/projects/dhsl/src");
-	Thread.sleep(dur!"seconds"(10));
+	listen(ServerSettings());
 }
 
 /* stuff below this line is not that interesting for users */
 private:
-void listen(shared HttpServer server) {
+struct Connection {
+	Socket socket;
+	char[] data;
+	SysTime lastAction;
+}
+
+void listen(ServerSettings settings) {
+	Socket listener = new TcpSocket;
+	scope (exit) {
+		listener.shutdown(SocketShutdown.BOTH);
+		listener.close();
+	}
+	listener.blocking = false;
+	listener.bind(new InternetAddress(settings.port));
+	listener.listen(settings.connectionQueueSize);
+	writeln("Listening on port ", settings.port);
+
+	SocketSet socketSet = new SocketSet(settings.maxConnections + 5); // TODO: not sure why it has to be +5, would expect +1 (for the listener) should be enough
+	Connection[] connections;
+
+	bool active = true;
+	while (active) {
+		socketSet.reset();
+		socketSet.add(listener);
+		foreach (Connection connection; connections)
+			socketSet.add(connection.socket);
+
+		Socket.select(socketSet, null, null);
+		int connectionIndex = 0;
+		SysTime minTime = Clock.currTime() - dur!("msecs")(settings.connectionTimeoutMs);
+		while (connectionIndex < connections.length) {
+			if (socketSet.isSet(connections[connectionIndex].socket)) {
+				// more data available for socket, read it
+				char[64] buffer; // TODO: larger buffer, small for testing
+				auto read = connections[connectionIndex].socket.receive(buffer);
+				if (read > 0) {
+					connections[connectionIndex].data ~= buffer[0 .. read];
+					connections[connectionIndex].lastAction = Clock.currTime();
+					++connectionIndex;
+					continue; // we're not done, expect more data later, continue to next socket
+				} else if (read == Socket.ERROR) {
+					writeln("Connection error");
+				} else {
+					writeln("Connection closed");
+				}
+				writefln("Received %s bytes from %s", connections[connectionIndex].data.length, connections[connectionIndex].socket.remoteAddress().toString());
+			} else if (connections[connectionIndex].lastAction < minTime) {
+				// this socket has timed out, remove it
+				writefln("Closing timed-out connection from %s after receiving %s bytes", connections[connectionIndex].socket.remoteAddress().toString(), connections[connectionIndex].data.length);
+			} else {
+				// no updates for this socket, continue to next
+				++connectionIndex;
+				continue;
+			}
+			connections[connectionIndex].socket.close();
+			if (connectionIndex != connections.length - 1)
+				connections[connectionIndex] = connections[$ - 1];
+			connections = connections[0 .. $ - 1];
+			writeln("Open connections: ", connections.length);
+		}
+
+		if (socketSet.isSet(listener)) {
+			// new connection
+			Socket socket = listener.accept();
+			if (connections.length >= settings.maxConnections) {
+				int oldestIndex = 0;
+				for (int index = 1; index < connections.length; ++index) {
+					if (connections[index].lastAction < connections[oldestIndex].lastAction)
+						oldestIndex = index;
+				}
+				writefln("Too many connections, forcing close of oldest connection, from %s after receiving %s bytes", connections[oldestIndex].socket.remoteAddress().toString(), connections[oldestIndex].data.length);
+				connections[oldestIndex].socket.close();
+				if (oldestIndex != connections.length - 1)
+					connections[oldestIndex] = connections[$ - 1];
+				connections = connections[0 .. $ - 1];
+			}
+			writefln("Socket from %s established", socket.remoteAddress().toString());
+			connections ~= Connection(socket, [], Clock.currTime());
+			writeln("Open connections: ", connections.length);
+		}
+	}
+}
+
+void listenOld(shared HttpServer server) {
 	Socket listener = new TcpSocket;
 	scope (exit) {
 		listener.shutdown(SocketShutdown.BOTH);
@@ -159,7 +244,7 @@ void listen(shared HttpServer server) {
 		++threads;
 		// TODO: while (something) receiveTimeout(dur!"usecs"(1), ... { --threads; });
 		writeln("listener.accept() stopped blocking");
-		receiveTimeout(dur!"usecs"(1), (OwnerTerminated) { active = false; }); 
+		//receiveTimeout(dur!"usecs"(1), (OwnerTerminated) { active = false; }); 
 	}
 }
 
@@ -261,6 +346,5 @@ HttpMessageRequest parseRequest(HttpMessage request) {
 	long pos = indexOf(entries[1], '?');
 	if (pos >= 0)
 		return HttpMessageRequest(entries[0], entries[1][0 .. pos], entries[1][pos .. $], entries[2], request);
-	else
-		return HttpMessageRequest(entries[0], entries[1], "", entries[2], request);
+	return HttpMessageRequest(entries[0], entries[1], "", entries[2], request);
 }

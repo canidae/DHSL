@@ -1,2 +1,2 @@
 #!/bin/bash
-dmd `find src -iname "*.d"` `find src -iname "*.di"` -debug -ofdhsl
+dmd `find src -iname "*.d"` `find src -iname "*.di"` -g -debug -ofdhsl
