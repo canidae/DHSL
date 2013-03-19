@@ -13,12 +13,39 @@ import std.string;
 struct ServerSettings {
 	ushort port = 8080;
 	int maxConnections = 2;
+	int threadCount = 10; // TODO: actually use this value
 	long maxRequestSize = 52428800;
-	int maxNewConnectionsFromHostPerSec = 3; // TODO: actually use this value
-	int maxHttpHeaderSize = 4096;
 	int connectionTimeoutMs = 180000;
-	int connectionQueueSize = 10;
 	int bufferSize = 4096;
+	int maxNewConnectionsFromHostPerSec = 3; // TODO: actually use this value
+	int connectionQueueSize = 10;
+	int maxHttpHeaderSize = 4096;
+}
+
+abstract class HttpHandler {
+	@property StaticRegex!char regex() {
+		return _regex;
+	}
+
+	/* TODO: see below
+	@property RegexMatch matcher() {
+		return _matcher;
+	}
+	*/
+
+	this(StaticRegex!char regex) {
+		_regex = regex;
+	}
+
+	HttpResponse handle(HttpRequest request);
+
+private:
+	StaticRegex!char _regex;
+	/* TODO: this fails:
+	   void foo(RegexMatch matcher) {}
+	   figure out why
+	RegexMatch _matcher;
+	*/
 }
 
 struct HttpRequest {
@@ -48,10 +75,6 @@ private:
 	string _query;
 	string[string] _headers;
 	ubyte[] _content;
-	/* the ones below are only used to help parse the request */
-	bool headersParsed;
-	long contentStart;
-	long contentLength;
 }
 
 struct HttpResponse {
@@ -91,6 +114,10 @@ private:
 	}
 }
 
+void addHandler(HttpHandler handler) {
+	handlers ~= handler;
+}
+
 /* TODO: temporary for testing, remove */
 void main() {
 	listen(ServerSettings());
@@ -109,9 +136,12 @@ abstract class Protocol {
 }
 
 class HttpProtocol : Protocol {
-	immutable string webSocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+	immutable webSocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 	static httpRequestStartLineRegexp = ctRegex!r"^([^ ]+) ([^ \?]+)\??([^ ]*) HTTP.*$";
 	ubyte[] buffer;
+	bool headersParsed;
+	long contentStart;
+	long contentLength;
 	HttpRequest request;
 
 	this(Connection connection) {
@@ -120,7 +150,7 @@ class HttpProtocol : Protocol {
 
 	override bool parseData(ubyte[] data) {
 		buffer ~= data;
-		if (!request.headersParsed) {
+		if (!headersParsed) {
 			long pos = indexOf(cast(string) buffer, cast(string) [13, 10]);
 			if (pos == -1) {
 				writeln("<CR><LF> not found in first packet, presumably broken HTTP request");
@@ -185,8 +215,8 @@ class HttpProtocol : Protocol {
 						break;
 
 					case "content-length":
-						request.contentLength = to!long(value);
-						if (request.contentLength > serverSettings.maxRequestSize)
+						contentLength = to!long(value);
+						if (contentLength > serverSettings.maxRequestSize)
 							return false;
 						break;
 
@@ -200,7 +230,8 @@ class HttpProtocol : Protocol {
 				writeln("No 'Host' specified in HTTP headers, not valid HTTP/1.1 request");
 				return false;
 			}
-			request.contentStart = pos + 4;
+			headersParsed = true;
+			contentStart = pos + 4;
 
 			/* websocket? */
 			if (hasConnection && hasOrigin && hasUpgrade && webSocketKey.length > 0 && hasWebSocketVersion) {
@@ -216,9 +247,9 @@ class HttpProtocol : Protocol {
 				connection.changeProtocol(new WebSocketProtocol(connection));
 			}
 		}
-		if (request.contentLength >= buffer.length - request.contentStart) {
-			request._content = buffer[request.contentStart .. request.contentStart + request.contentLength];
-			buffer = buffer[request.contentStart + request.contentLength .. $];
+		if (contentLength >= buffer.length - contentStart) {
+			request._content = buffer[contentStart .. contentStart + contentLength];
+			buffer = buffer[contentStart + contentLength .. $];
 			// TODO: return response
 			HttpResponse response;
 			response.status = 404;
@@ -358,6 +389,14 @@ class Connection {
 }
 
 ServerSettings serverSettings;
+HttpHandler[] handlers;
+
+void handleHttpRequest(Tid tid) {
+	/* ahh, fuck this shit. cast shit to shared and promise not to modify it */
+	receive((HttpRequest request) {
+		writeln("Received request: ", request);
+	});
+}
 
 void listen(ServerSettings settings) {
 	serverSettings = settings;
