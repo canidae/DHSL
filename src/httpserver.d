@@ -12,7 +12,7 @@ import std.string;
 
 struct ServerSettings {
 	ushort port = 8080;
-	int maxConnections = 2;
+	int maxConnections = 2; // TODO: actually use this value
 	int threadCount = 10; // TODO: actually use this value
 	long maxRequestSize = 52428800;
 	int connectionTimeoutMs = 180000;
@@ -116,11 +116,6 @@ private:
 
 void addHandler(HttpHandler handler) {
 	handlers ~= handler;
-}
-
-/* TODO: temporary for testing, remove */
-void main() {
-	listen(ServerSettings());
 }
 
 /* stuff below this line is not that interesting for users */
@@ -245,6 +240,7 @@ class HttpProtocol : Protocol {
 				response.setHeader("Sec-WebSocket-Accept", webSocketAccept);
 				connection.send(response.toBytes());
 				connection.changeProtocol(new WebSocketProtocol(connection));
+				return true; // no longer an HTTP protocol
 			}
 		}
 		if (contentLength >= buffer.length - contentStart) {
@@ -275,7 +271,7 @@ class WebSocketProtocol : Protocol {
 	ubyte[] buffer;
 	bool newFrame;
 	long length; // TODO: websocket allows length up to 2^64, we don't have that much memory! need to set a max limit and/or offload to disk
-	char[] mask;
+	ubyte[] mask;
 
 	this(Connection connection) {
 		super(connection);
@@ -284,42 +280,46 @@ class WebSocketProtocol : Protocol {
 
 	override bool parseData(ubyte[] data) {
 		buffer ~= data;
-		if (newFrame) {
-			/* new frame */
-			int pos = 0;
-			//bool finalFrame = (buffer[pos] & 0b10000000) != 0; // first bit denotes whether it's the final frame or more follows, ignored for now
-			if ((buffer[pos] & 0b01110000) != 0)
-				return false; // next 3 bits don't match expected binary values [000]
-			packetType = cast(PacketType) (buffer[pos] & 0b00001111); // next 4 bits denotes packet type
-			++pos;
-			if ((buffer[pos] & 0b10000000) == 0)
-				return false; // next bit denotes masking, client must always set this bit
-			length = (buffer[pos] & 0b01111111); // next 7 bits denotes payload size
-			++pos;
-			if (length == 126) {
-				/* unless the 7 bits makes up the value 126, then the following 16 bits denotes length */
-				length = (buffer[pos++] << 8) + buffer[pos++];
-			} else if (length == 127) {
-				/* or the 7 bits makes up the value 127, then the following 64 bits denotes length */
-				length = (buffer[pos++] << 24) + (buffer[pos++] << 16) + (buffer[pos++] << 8) + buffer[pos++];
+		while (buffer.length > 0) {
+			/* TODO: what if we get slightly more than one frame, but not enough to parse the entire header? */
+			if (newFrame) {
+				/* new frame */
+				int pos = 0;
+				//bool finalFrame = (buffer[pos] & 0b10000000) != 0; // first bit denotes whether it's the final frame or more follows, ignored for now
+				if ((buffer[pos] & 0b01110000) != 0) {
+					return false; // next 3 bits don't match expected binary values [000]
+				}
+				packetType = cast(PacketType) (buffer[pos] & 0b00001111); // next 4 bits denotes packet type
+				++pos;
+				if ((buffer[pos] & 0b10000000) == 0)
+					return false; // next bit denotes masking, client must always set this bit
+				length = (buffer[pos] & 0b01111111); // next 7 bits denotes payload size
+				++pos;
+				if (length == 126) {
+					/* unless the 7 bits makes up the value 126, then the following 16 bits denotes length */
+					length = (buffer[pos++] << 8) + buffer[pos++];
+				} else if (length == 127) {
+					/* or the 7 bits makes up the value 127, then the following 64 bits denotes length */
+					length = (buffer[pos++] << 24) + (buffer[pos++] << 16) + (buffer[pos++] << 8) + buffer[pos++];
+				}
+				if (length > serverSettings.maxRequestSize)
+					return false;
+				mask.length = 4;
+				for (int a = 0; a < 4; ++a)
+					mask[a] = cast(ubyte) buffer[pos++];
+				buffer = buffer[pos .. $]; // discard header from buffer
+				newFrame = false;
 			}
-			if (length > serverSettings.maxRequestSize)
-				return false;
-			mask.length = 4;
-			for (int a = 0; a < 4; ++a)
-				mask[a] = cast(char) buffer[pos++];
-			buffer = buffer[pos .. $]; // discard header from buffer
-			newFrame = false;
-		}
-		if (buffer.length >= length) {
-			/* received all data, do something! anything! */
-			// TODO
-			// unmask (TODO: do this each time we receive data, not all at once)
-			foreach (index, ref b; buffer)
-				b ^= mask[index % 4];
-			writeln("websocket message: ", cast(string) buffer);
-			newFrame = true;
-			buffer.length -= length;
+			if (buffer.length >= length) {
+				/* received all data, do something! anything! */
+				// TODO
+				// unmask (TODO: do this each time we receive data, not all at once)
+				foreach (index, ref b; buffer[0 .. length])
+					b ^= mask[index % 4];
+				writefln("websocket message [buffer: %s/%s]: %s", length, buffer.length, cast(string) buffer[0 .. length]);
+				newFrame = true;
+				buffer = buffer[length .. $];
+			}
 		}
 		return true;
 	}
@@ -327,16 +327,15 @@ class WebSocketProtocol : Protocol {
 
 class Connection {
 	Socket socket;
-	SysTime lastAction;
 	Protocol protocol;
 	ubyte[] output;
-	bool writeReady;
 
 	this(Socket socket) {
 		this.socket = socket;
-		lastAction = Clock.currTime();
+		socket.blocking = true;
+		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(serverSettings.connectionTimeoutMs));
+		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, dur!"msecs"(serverSettings.connectionTimeoutMs));
 		protocol = new HttpProtocol(this);
-		writeReady = true;
 	}
 
 	void changeProtocol(Protocol protocol) {
@@ -350,12 +349,11 @@ class Connection {
 
 	/* returns true if connection is to be kept alive, false if it's to be closed */
 	bool read() {
-		lastAction = Clock.currTime();
 		ubyte[] buffer;
 		buffer.length = serverSettings.bufferSize;
 		auto read = socket.receive(buffer);
 		if (read > 0) {
-			writeln("Read: ", cast(string) buffer[0 .. read]);
+			//writeln("Read: ", cast(string) buffer[0 .. read]);
 			return protocol.parseData(buffer[0 .. read]);
 		} else if (read == Socket.ERROR) {
 			// connection error
@@ -375,15 +373,14 @@ class Connection {
 			// connection error
 			return false;
 		}
-		writeln("Wrote: ", cast(string) output[0 .. sent]);
+		//writeln("Wrote: ", cast(string) output[0 .. sent]);
 		// remove sent bytes from output buffer
 		output = output[sent .. $];
-		writeReady = false;
-		lastAction = Clock.currTime();
 		return true;
 	}
 
 	void close() {
+		socket.shutdown(SocketShutdown.BOTH);
 		socket.close();
 	}
 }
@@ -391,11 +388,9 @@ class Connection {
 ServerSettings serverSettings;
 HttpHandler[] handlers;
 
-void handleHttpRequest(Tid tid) {
-	/* ahh, fuck this shit. cast shit to shared and promise not to modify it */
-	receive((HttpRequest request) {
-		writeln("Received request: ", request);
-	});
+/* TODO: temporary for testing, remove */
+void main() {
+	listen(ServerSettings());
 }
 
 void listen(ServerSettings settings) {
@@ -405,78 +400,49 @@ void listen(ServerSettings settings) {
 		listener.shutdown(SocketShutdown.BOTH);
 		listener.close();
 	}
-	listener.blocking = false;
+	listener.blocking = true;
 	listener.bind(new InternetAddress(settings.port));
 	listener.listen(settings.connectionQueueSize);
+	listener.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(1000)); // don't block for more than a second at a time
 	writeln("Listening on port ", settings.port);
 
-	Connection[] connections;
-	SocketSet readSet = new SocketSet(settings.maxConnections + 5); // TODO: not sure why it has to be +5, would expect +1 (for the listener) to be enough
-	SocketSet writeSet = new SocketSet(settings.maxConnections + 4); // TODO: not sure why it has to be +4, would expect settings.maxConnections to be enough
-
+	SysTime[Tid] threads;
 	bool active = true;
 	while (active) {
-		writeSet.reset();
-		readSet.reset();
-		readSet.add(listener);
-		foreach (Connection connection; connections) {
-			readSet.add(connection.socket);
-			if (!connection.writeReady)
-				writeSet.add(connection.socket);
+		try {
+			threads[spawn(&handleConnection, cast(shared) listener.accept(), thisTid)] = Clock.currTime();
+		} catch (SocketAcceptException e) {
+			/* happens every time listener accept() times out, nothing to worry about */
 		}
-
-		Socket.select(readSet, writeSet, null);
-		SysTime minTime = Clock.currTime() - dur!("msecs")(settings.connectionTimeoutMs);
-		int index = 0;
-		int oldestIndex = 0;
-		while (index < connections.length) {
-			bool close;
-			bool write;
-			if (readSet.isSet(connections[index].socket)) {
-				// data available for reading
-				close = !connections[index].read();
-			} else if (writeSet.isSet(connections[index].socket)) {
-				// connection ready for writing
-				connections[index].writeReady = true;
-				connections[index].write();
-			} else if (connections[index].lastAction < minTime) {
-				// connection has timed out
-				writefln("Connection with %s timed out", connections[index].socket.remoteAddress().toString());
-				close = true;
-			} else if (connections[index].lastAction < connections[oldestIndex].lastAction) {
-				// in case we need to kick out an old connection to make room for a new.
-				// note that this will skip any sockets with read/write changes or those that has timed out,
-				// but this doesn't matter as those either will have a _very_ recent lastAction or will be removed,
-				// in which case oldestIndex won't be used as we're making room for any new connections.
-				// if every single socket got read/write changes this iteration and we don't have any room for more connections,
-				// something which is highly unlikely, then the connection at index 0 will be killed.
-				oldestIndex = index;
-			}
-			if (close) {
-				writefln("Closing connection with %s", connections[index].socket.remoteAddress().toString());
-				connections[index].close();
-				if (index != connections.length - 1)
-					connections[index] = connections[$ - 1];
-				connections = connections[0 .. $ - 1];
-			} else {
-				++index;
-			}
+		bool messages = true;
+		while (messages) {
+			messages = receiveTimeout(dur!"msecs"(0), (Tid child) {
+				/* socket is no longer active, remove it */
+				threads.remove(child);
+			}, (Tid child, SysTime lastActivity) {
+				/* set new last activity for connection */
+				threads[child] = lastActivity;
+			});
 		}
-
-		if (connections.length > settings.maxConnections) {
-			// too many connections
-			writefln("Too many connections (%s/%s), forcing close of oldest connection, from %s", connections.length, settings.maxConnections, connections[oldestIndex].socket.remoteAddress().toString());
-			connections[oldestIndex].close();
-			if (oldestIndex != connections.length - 1)
-				connections[oldestIndex] = connections[$ - 1];
-			connections = connections[0 .. $ - 1];
-		}
-
-		if (readSet.isSet(listener)) {
-			// new connection
-			Connection connection = new Connection(listener.accept());
-			writefln("Connection from %s established", connection.socket.remoteAddress().toString());
-			connections ~= connection;
+		if (threads.length > serverSettings.maxConnections) {
+			/* TODO: remove oldest last active connection(?) */
+			/* with ping-ponging websocket then "last active connection" will be completely arbitrary, though */
 		}
 	}
+}
+
+void handleConnection(shared Socket ssocket, Tid parent) {
+	Connection connection = new Connection(cast(Socket) ssocket);
+	scope (exit) {
+		connection.close();
+	}
+	bool active = true;
+	while (active) {
+		active = connection.read();
+		if (active)
+			active = connection.write();
+		send(parent, thisTid, Clock.currTime());
+	}
+	writefln("Closing connection with %s", connection.socket.remoteAddress().toString());
+	send(parent, thisTid);
 }
