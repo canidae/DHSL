@@ -5,10 +5,12 @@ import std.concurrency;
 import std.conv;
 import std.datetime;
 import std.digest.sha;
+import std.file;
 import std.regex;
 import std.socket;
 import std.stdio;
 import std.string;
+import std.traits;
 
 struct ServerSettings {
 	ushort port = 8080;
@@ -20,32 +22,6 @@ struct ServerSettings {
 	int maxNewConnectionsFromHostPerSec = 3; // TODO: actually use this value
 	int connectionQueueSize = 10;
 	int maxHttpHeaderSize = 4096;
-}
-
-abstract class HttpHandler {
-	@property StaticRegex!char regex() {
-		return _regex;
-	}
-
-	/* TODO: see below
-	@property RegexMatch matcher() {
-		return _matcher;
-	}
-	*/
-
-	this(StaticRegex!char regex) {
-		_regex = regex;
-	}
-
-	HttpResponse handle(HttpRequest request);
-
-private:
-	StaticRegex!char _regex;
-	/* TODO: this fails:
-	   void foo(RegexMatch matcher) {}
-	   figure out why
-	RegexMatch _matcher;
-	*/
 }
 
 struct HttpRequest {
@@ -86,6 +62,10 @@ struct HttpResponse {
 	}
 
 	bool setHeader(string key, string value) {
+		if (value.length == 0) {
+			_headers.remove(key);
+			return true;
+		}
 		key = toLower(key);
 		switch (key) {
 		case "content-length":
@@ -114,8 +94,66 @@ private:
 	}
 }
 
-void addHandler(HttpHandler handler) {
-	handlers ~= handler;
+abstract class HttpHandler {
+	@property auto regexp() {
+		return _regexp;
+	}
+
+	@property auto matcher() {
+		return _matcher;
+	}
+
+	this(Regex!char regexp) {
+		_regexp = regexp;
+	}
+
+	HttpResponse handle(HttpRequest request, Address remote, Address local);
+
+private:
+	Regex!char _regexp;
+	ReturnType!matchText _matcher;
+
+	auto matchText(string text) {
+		return match(text, _regexp);
+	}
+}
+
+class FileHttpHandler : HttpHandler {
+	this(string path) {
+		super(regex(path));
+		_path = path;
+	}
+
+	override HttpResponse handle(HttpRequest request, Address remote, Address local) {
+		HttpResponse response;
+		response.content = cast(ubyte[]) readText(_path);
+		return response;
+	}
+
+private:
+	string _path;
+}
+
+void startServer(ServerSettings settings) {
+	writeln("spawning listener thread");
+	listenerThread = spawn(&listen, settings, thisTid);
+	writeln("sleeping 10 seconds");
+	core.thread.Thread.sleep(dur!"seconds"(10));
+	writeln("telling listener thread to shut down");
+	send(listenerThread, thisTid);
+	writeln("waiting for listener to finish");
+	receiveOnly!Tid();
+	writeln("exiting");
+}
+
+void addHandler(HttpHandler httpHandler) {
+	/* TODO: this doesn't work, it's only added to active thread, not all threads */
+	writeln("adding handler: ", httpHandler);
+	httpHandlers ~= httpHandler;
+}
+
+void stopServer() {
+	send(listenerThread, thisTid);
 }
 
 /* stuff below this line is not that interesting for users */
@@ -127,7 +165,7 @@ abstract class Protocol {
 		this.connection = connection;
 	}
 
-	abstract bool parseData(ubyte[] data);
+	abstract bool parseData(ubyte[] data, Socket socket);
 }
 
 class HttpProtocol : Protocol {
@@ -143,7 +181,7 @@ class HttpProtocol : Protocol {
 		super(connection);
 	}
 
-	override bool parseData(ubyte[] data) {
+	override bool parseData(ubyte[] data, Socket socket) {
 		buffer ~= data;
 		if (!headersParsed) {
 			long pos = indexOf(cast(string) buffer, cast(string) [13, 10]);
@@ -158,7 +196,7 @@ class HttpProtocol : Protocol {
 			}
 			string startLine = cast(string) buffer[0 .. pos];
 			request._method = to!string(matcher.captures[1]);
-			request._path = to!string(matcher.captures[2]);
+			request._path = to!string(matcher.captures[2])[1 .. $]; // chop first /
 			request._query = to!string(matcher.captures[3]);
 			long headerStart = pos + 2;
 			pos = indexOf(cast(string) buffer[headerStart .. $], cast(string) [13, 10, 13, 10]);
@@ -230,7 +268,7 @@ class HttpProtocol : Protocol {
 
 			/* websocket? */
 			if (hasConnection && hasOrigin && hasUpgrade && webSocketKey.length > 0 && hasWebSocketVersion) {
-				writeln("Upgrading connection to a WebSocket");
+				writeln("Upgrading connection to WebSocket");
 				auto shaHash = sha1Of(webSocketKey ~ webSocketMagic);
 				string webSocketAccept = to!string(Base64.encode(shaHash));
 				HttpResponse response;
@@ -240,16 +278,29 @@ class HttpProtocol : Protocol {
 				response.setHeader("Sec-WebSocket-Accept", webSocketAccept);
 				connection.send(response.toBytes());
 				connection.changeProtocol(new WebSocketProtocol(connection));
-				return true; // no longer an HTTP protocol
+				return true; // no longer a HTTP protocol
 			}
 		}
 		if (contentLength >= buffer.length - contentStart) {
 			request._content = buffer[contentStart .. contentStart + contentLength];
 			buffer = buffer[contentStart + contentLength .. $];
-			// TODO: return response
+			writeln("looking for handler matching path: ", request._path);
+			bool responseFound = false;
 			HttpResponse response;
-			response.status = 404;
-			response.content = cast(ubyte[]) "Four, oh four! Nothing found :(";
+			foreach (handler; httpHandlers) {
+				writeln("trying first handler");
+				handler._matcher = handler.matchText(request._path);
+				if (handler._matcher) {
+					/* this handler match */
+					responseFound = true;
+					response = handler.handle(request, socket.remoteAddress(), socket.localAddress());
+					break;
+				}
+			}
+			if (!responseFound) {
+				response.status = 404;
+				response.content = cast(ubyte[]) "Four, oh four! Nothing found :(";
+			}
 			connection.send(response.toBytes());
 			request = HttpRequest();
 		}
@@ -278,7 +329,7 @@ class WebSocketProtocol : Protocol {
 		newFrame = true;
 	}
 
-	override bool parseData(ubyte[] data) {
+	override bool parseData(ubyte[] data, Socket socket) {
 		buffer ~= data;
 		while (buffer.length > 0) {
 			/* TODO: what if we get slightly more than one frame, but not enough to parse the entire header? */
@@ -333,8 +384,8 @@ class Connection {
 	this(Socket socket) {
 		this.socket = socket;
 		socket.blocking = true;
-		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(serverSettings.connectionTimeoutMs));
-		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, dur!"msecs"(serverSettings.connectionTimeoutMs));
+		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(10000));
+		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, dur!"msecs"(10000));
 		protocol = new HttpProtocol(this);
 	}
 
@@ -354,14 +405,16 @@ class Connection {
 		auto read = socket.receive(buffer);
 		if (read > 0) {
 			//writeln("Read: ", cast(string) buffer[0 .. read]);
-			return protocol.parseData(buffer[0 .. read]);
-		} else if (read == Socket.ERROR) {
+			return protocol.parseData(buffer[0 .. read], socket);
+		} else if (read == 0) {
+			// connection closed
+			return false;
+		} else if (read == Socket.ERROR && !socket.isAlive()) {
 			// connection error
 			writefln("Connection error with %s", socket.remoteAddress().toString());
-		} else {
-			// connection closed
+			return false;
 		}
-		return false;
+		return socket.isAlive();
 	}
 
 	/* returns true if connection is to be kept alive, false if it's to be closed */
@@ -386,19 +439,25 @@ class Connection {
 }
 
 ServerSettings serverSettings;
-HttpHandler[] handlers;
+HttpHandler[] httpHandlers; // TODO: won't work, not shared across threads
+// TODO: WebSocketHandler webSocketHandler; // won't work, not shared across threads
+Tid listenerThread;
 
 /* TODO: temporary for testing, remove */
 void main() {
-	listen(ServerSettings());
+	addHandler(new FileHttpHandler("src/httpserver.d"));
+	writeln("handlers.length: ", httpHandlers.length);
+	startServer(ServerSettings());
 }
 
-void listen(ServerSettings settings) {
+void listen(ServerSettings settings, Tid parentTid) {
+	writeln("listen: handlers.length: ", httpHandlers.length);
 	serverSettings = settings;
 	Socket listener = new TcpSocket;
 	scope (exit) {
 		listener.shutdown(SocketShutdown.BOTH);
 		listener.close();
+		send(parentTid, thisTid);
 	}
 	listener.blocking = true;
 	listener.bind(new InternetAddress(settings.port));
@@ -416,12 +475,11 @@ void listen(ServerSettings settings) {
 		}
 		bool messages = true;
 		while (messages) {
-			messages = receiveTimeout(dur!"msecs"(0), (Tid child) {
-				/* socket is no longer active, remove it */
-				threads.remove(child);
-			}, (Tid child, SysTime lastActivity) {
-				/* set new last activity for connection */
-				threads[child] = lastActivity;
+			messages = receiveTimeout(dur!"msecs"(0), (Tid tid) {
+				if (tid == parentTid)
+					active = false; // server shutdown requested
+				else
+					threads.remove(tid); // socket is no longer active, remove it
 			});
 		}
 		if (threads.length > serverSettings.maxConnections) {
@@ -429,20 +487,30 @@ void listen(ServerSettings settings) {
 			/* with ping-ponging websocket then "last active connection" will be completely arbitrary, though */
 		}
 	}
+	foreach (tid, activity; threads)
+		send(tid, thisTid);
+	while (threads.length > 0) {
+		receive((Tid tid) {
+			threads.remove(tid); // socket is no longer active, remove it
+		});
+	}
 }
 
-void handleConnection(shared Socket ssocket, Tid parent) {
+void handleConnection(shared Socket ssocket, Tid parentTid) {
 	Connection connection = new Connection(cast(Socket) ssocket);
 	scope (exit) {
 		connection.close();
+		send(parentTid, thisTid);
 	}
 	bool active = true;
 	while (active) {
 		active = connection.read();
 		if (active)
 			active = connection.write();
-		send(parent, thisTid, Clock.currTime());
+		receiveTimeout(dur!"msecs"(0), (Tid tid) {
+			if (tid == parentTid)
+				active = false; // server shutdown requested
+		});
 	}
 	writefln("Closing connection with %s", connection.socket.remoteAddress().toString());
-	send(parent, thisTid);
 }
