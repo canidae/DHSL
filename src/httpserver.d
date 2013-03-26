@@ -14,14 +14,49 @@ import std.traits;
 
 struct ServerSettings {
 	ushort port = 8080;
-	int maxConnections = 2; // TODO: actually use this value
-	int threadCount = 10; // TODO: actually use this value
+	int maxConnections = 2;
 	long maxRequestSize = 52428800;
 	int connectionTimeoutMs = 180000;
 	int bufferSize = 4096;
 	int maxNewConnectionsFromHostPerSec = 3; // TODO: actually use this value
 	int connectionQueueSize = 10;
 	int maxHttpHeaderSize = 4096;
+	// TODO: gzip compression, see std.zlib
+}
+
+abstract class DynamicHttpHandler : HttpHandler {
+	this(Regex!char regexp) {
+		super(regexp);
+	}
+
+	HttpResponse handle(HttpRequest request, Address remote);
+}
+
+abstract class StaticHttpHandler : HttpHandler {
+	this(Regex!char regexp, HttpResponse response) {
+		super(regexp);
+		_response = response.toBytes();
+	}
+
+private:
+	ubyte[] _response;
+}
+
+/* TODO: this really isn't a part of the library, should be removed */
+class DynamicFileHttpHandler : DynamicHttpHandler {
+	this(string path) {
+		super(regex(path));
+		_path = path;
+	}
+
+	override HttpResponse handle(HttpRequest request, Address remote) {
+		HttpResponse response;
+		response.content = cast(ubyte[]) readText(_path);
+		return response;
+	}
+
+private:
+	string _path;
 }
 
 struct HttpRequest {
@@ -94,6 +129,21 @@ private:
 	}
 }
 
+void addDynamicHandler(DynamicHttpHandler httpHandler) {
+	writeln("adding handler: ", httpHandler);
+	dynamicHttpHandlers ~= cast(shared) httpHandler;
+}
+
+void startServer(ServerSettings settings) {
+	listenerThread = spawn(&listen, settings, thisTid);
+}
+
+void stopServer() {
+	send(listenerThread, thisTid);
+}
+
+/* stuff below this line is not that interesting for users */
+private:
 abstract class HttpHandler {
 	@property auto regexp() {
 		return _regexp;
@@ -107,8 +157,6 @@ abstract class HttpHandler {
 		_regexp = regexp;
 	}
 
-	HttpResponse handle(HttpRequest request, Address remote, Address local);
-
 private:
 	Regex!char _regexp;
 	ReturnType!matchText _matcher;
@@ -118,46 +166,6 @@ private:
 	}
 }
 
-class FileHttpHandler : HttpHandler {
-	this(string path) {
-		super(regex(path));
-		_path = path;
-	}
-
-	override HttpResponse handle(HttpRequest request, Address remote, Address local) {
-		HttpResponse response;
-		response.content = cast(ubyte[]) readText(_path);
-		return response;
-	}
-
-private:
-	string _path;
-}
-
-void startServer(ServerSettings settings) {
-	writeln("spawning listener thread");
-	listenerThread = spawn(&listen, settings, thisTid);
-	writeln("sleeping 10 seconds");
-	core.thread.Thread.sleep(dur!"seconds"(10));
-	writeln("telling listener thread to shut down");
-	send(listenerThread, thisTid);
-	writeln("waiting for listener to finish");
-	receiveOnly!Tid();
-	writeln("exiting");
-}
-
-void addHandler(HttpHandler httpHandler) {
-	/* TODO: this doesn't work, it's only added to active thread, not all threads */
-	writeln("adding handler: ", httpHandler);
-	httpHandlers ~= httpHandler;
-}
-
-void stopServer() {
-	send(listenerThread, thisTid);
-}
-
-/* stuff below this line is not that interesting for users */
-private:
 abstract class Protocol {
 	Connection connection;
 
@@ -165,7 +173,7 @@ abstract class Protocol {
 		this.connection = connection;
 	}
 
-	abstract bool parseData(ubyte[] data, Socket socket);
+	abstract bool parseData(ubyte[] data, Address remoteAddress);
 }
 
 class HttpProtocol : Protocol {
@@ -181,7 +189,7 @@ class HttpProtocol : Protocol {
 		super(connection);
 	}
 
-	override bool parseData(ubyte[] data, Socket socket) {
+	override bool parseData(ubyte[] data, Address remoteAddress) {
 		buffer ~= data;
 		if (!headersParsed) {
 			long pos = indexOf(cast(string) buffer, cast(string) [13, 10]);
@@ -285,23 +293,34 @@ class HttpProtocol : Protocol {
 			request._content = buffer[contentStart .. contentStart + contentLength];
 			buffer = buffer[contentStart + contentLength .. $];
 			writeln("looking for handler matching path: ", request._path);
-			bool responseFound = false;
-			HttpResponse response;
-			foreach (handler; httpHandlers) {
-				writeln("trying first handler");
+			ubyte[] response;
+			foreach (shandler; staticHttpHandlers) {
+				writeln("trying static handler");
+				StaticHttpHandler handler = cast(StaticHttpHandler) shandler;
 				handler._matcher = handler.matchText(request._path);
 				if (handler._matcher) {
-					/* this handler match */
-					responseFound = true;
-					response = handler.handle(request, socket.remoteAddress(), socket.localAddress());
+					response = handler._response;
 					break;
 				}
 			}
-			if (!responseFound) {
-				response.status = 404;
-				response.content = cast(ubyte[]) "Four, oh four! Nothing found :(";
+			if (response.length == 0) {
+				foreach (shandler; dynamicHttpHandlers) {
+					writeln("trying dynamic handler");
+					DynamicHttpHandler handler = cast(DynamicHttpHandler) shandler;
+					handler._matcher = handler.matchText(request._path);
+					if (handler._matcher) {
+						response = handler.handle(request, remoteAddress).toBytes();
+						break;
+					}
+				}
 			}
-			connection.send(response.toBytes());
+			if (response.length == 0) {
+				HttpResponse httpResponse;
+				httpResponse.status = 404;
+				httpResponse.content = cast(ubyte[]) "Four, oh four! Nothing found :(";
+				response = httpResponse.toBytes();
+			}
+			connection.send(response);
 			request = HttpRequest();
 		}
 		return true;
@@ -321,7 +340,7 @@ class WebSocketProtocol : Protocol {
 	PacketType packetType;
 	ubyte[] buffer;
 	bool newFrame;
-	long length; // TODO: websocket allows length up to 2^64, we don't have that much memory! need to set a max limit and/or offload to disk
+	long length;
 	ubyte[] mask;
 
 	this(Connection connection) {
@@ -329,7 +348,7 @@ class WebSocketProtocol : Protocol {
 		newFrame = true;
 	}
 
-	override bool parseData(ubyte[] data, Socket socket) {
+	override bool parseData(ubyte[] data, Address remoteAddress) {
 		buffer ~= data;
 		while (buffer.length > 0) {
 			/* TODO: what if we get slightly more than one frame, but not enough to parse the entire header? */
@@ -364,7 +383,6 @@ class WebSocketProtocol : Protocol {
 			if (buffer.length >= length) {
 				/* received all data, do something! anything! */
 				// TODO
-				// unmask (TODO: do this each time we receive data, not all at once)
 				foreach (index, ref b; buffer[0 .. length])
 					b ^= mask[index % 4];
 				writefln("websocket message [buffer: %s/%s]: %s", length, buffer.length, cast(string) buffer[0 .. length]);
@@ -378,14 +396,16 @@ class WebSocketProtocol : Protocol {
 
 class Connection {
 	Socket socket;
+	Address remoteAddress;
 	Protocol protocol;
-	ubyte[] output;
+	ubyte[][] output;
 
-	this(Socket socket) {
-		this.socket = socket;
+	this(shared Socket ssocket) {
+		this.socket = cast(Socket) ssocket;
+		remoteAddress = socket.remoteAddress();
 		socket.blocking = true;
-		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(10000));
-		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, dur!"msecs"(10000));
+		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(serverSettings.connectionTimeoutMs));
+		socket.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, dur!"msecs"(serverSettings.connectionTimeoutMs));
 		protocol = new HttpProtocol(this);
 	}
 
@@ -402,33 +422,44 @@ class Connection {
 	bool read() {
 		ubyte[] buffer;
 		buffer.length = serverSettings.bufferSize;
-		auto read = socket.receive(buffer);
+		ptrdiff_t read;
+		bool isAlive;
+		synchronized (socket) {
+			read = socket.receive(buffer);
+			isAlive = socket.isAlive();
+		}
 		if (read > 0) {
 			//writeln("Read: ", cast(string) buffer[0 .. read]);
-			return protocol.parseData(buffer[0 .. read], socket);
+			return protocol.parseData(buffer[0 .. read], remoteAddress);
 		} else if (read == 0) {
 			// connection closed
 			return false;
-		} else if (read == Socket.ERROR && !socket.isAlive()) {
+		} else if (read == Socket.ERROR && !isAlive) {
 			// connection error
-			writefln("Connection error with %s", socket.remoteAddress().toString());
+			writefln("Connection error with %s", remoteAddress.toString());
 			return false;
 		}
-		return socket.isAlive();
+		return isAlive;
 	}
 
 	/* returns true if connection is to be kept alive, false if it's to be closed */
 	bool write() {
-		if (output.length <= 0)
-			return true; // nothing to send
-		auto sent = socket.send(output[0 .. (output.length > serverSettings.bufferSize ? serverSettings.bufferSize : output.length)]);
-		if (sent == Socket.ERROR) {
-			// connection error
-			return false;
+		while (output.length > 0) {
+			ptrdiff_t sent;
+			synchronized (socket) {
+				sent = socket.send(output[0]);
+			}
+			writefln("Writing output[%s][%s], sent = %s", output.length, output[0].length, sent);
+			if (sent == Socket.ERROR) {
+				// connection error
+				return false;
+			}
+			//writeln("Wrote: ", cast(string) output[0 .. sent]);
+			// remove sent bytes from output buffer
+			output[0] = output[0][sent .. $];
+			if (output[0].length <= 0)
+				output = output[1 .. $];
 		}
-		//writeln("Wrote: ", cast(string) output[0 .. sent]);
-		// remove sent bytes from output buffer
-		output = output[sent .. $];
 		return true;
 	}
 
@@ -439,19 +470,28 @@ class Connection {
 }
 
 ServerSettings serverSettings;
-HttpHandler[] httpHandlers; // TODO: won't work, not shared across threads
-// TODO: WebSocketHandler webSocketHandler; // won't work, not shared across threads
+shared StaticHttpHandler[] staticHttpHandlers;
+shared DynamicHttpHandler[] dynamicHttpHandlers;
+//shared WebSocketHandler webSocketHandler;
 Tid listenerThread;
 
 /* TODO: temporary for testing, remove */
 void main() {
-	addHandler(new FileHttpHandler("src/httpserver.d"));
-	writeln("handlers.length: ", httpHandlers.length);
+	addDynamicHandler(new DynamicFileHttpHandler("src/httpserver.d"));
+	writeln("handlers.length: ", dynamicHttpHandlers.length);
+	writeln("spawning listener thread");
 	startServer(ServerSettings());
+	writeln("sleeping 10 seconds");
+	core.thread.Thread.sleep(dur!"seconds"(10));
+	writeln("telling listener thread to shut down");
+	stopServer();
+	writeln("waiting for listener to finish");
+	receiveOnly!Tid();
+	writeln("exiting");
 }
 
 void listen(ServerSettings settings, Tid parentTid) {
-	writeln("listen: handlers.length: ", httpHandlers.length);
+	writeln("listen: handlers.length: ", dynamicHttpHandlers.length);
 	serverSettings = settings;
 	Socket listener = new TcpSocket;
 	scope (exit) {
@@ -461,7 +501,7 @@ void listen(ServerSettings settings, Tid parentTid) {
 	}
 	listener.blocking = true;
 	listener.bind(new InternetAddress(settings.port));
-	listener.listen(settings.connectionQueueSize);
+	listener.listen(settings.connectionQueueSize); // TODO: may fail if port is not available. also: we're currently not closing the port properly upon exiting, find out why
 	listener.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(1000)); // don't block for more than a second at a time
 	writeln("Listening on port ", settings.port);
 
@@ -497,7 +537,7 @@ void listen(ServerSettings settings, Tid parentTid) {
 }
 
 void handleConnection(shared Socket ssocket, Tid parentTid) {
-	Connection connection = new Connection(cast(Socket) ssocket);
+	Connection connection = new Connection(ssocket);
 	scope (exit) {
 		connection.close();
 		send(parentTid, thisTid);
@@ -505,12 +545,10 @@ void handleConnection(shared Socket ssocket, Tid parentTid) {
 	bool active = true;
 	while (active) {
 		active = connection.read();
-		if (active)
-			active = connection.write();
 		receiveTimeout(dur!"msecs"(0), (Tid tid) {
 			if (tid == parentTid)
 				active = false; // server shutdown requested
 		});
 	}
-	writefln("Closing connection with %s", connection.socket.remoteAddress().toString());
+	writefln("Closing connection with %s", connection.remoteAddress.toString());
 }
