@@ -1,13 +1,14 @@
 module exent.httpserver;
 
+public import std.regex;
+public import std.socket;
+
 import std.base64;
 import std.concurrency;
 import std.conv;
 import std.datetime;
 import std.digest.sha;
 import std.file;
-import std.regex;
-import std.socket;
 import std.stdio;
 import std.string;
 import std.traits;
@@ -140,6 +141,7 @@ void startServer(ServerSettings settings) {
 
 void stopServer() {
 	send(listenerThread, thisTid);
+	receiveOnly!Tid();
 }
 
 /* stuff below this line is not that interesting for users */
@@ -474,21 +476,6 @@ shared StaticHttpHandler[] staticHttpHandlers;
 shared DynamicHttpHandler[] dynamicHttpHandlers;
 //shared WebSocketHandler webSocketHandler;
 Tid listenerThread;
-
-/* TODO: temporary for testing, remove */
-void main() {
-	addDynamicHandler(new DynamicFileHttpHandler("src/httpserver.d"));
-	writeln("handlers.length: ", dynamicHttpHandlers.length);
-	writeln("spawning listener thread");
-	startServer(ServerSettings());
-	writeln("sleeping 10 seconds");
-	core.thread.Thread.sleep(dur!"seconds"(10));
-	writeln("telling listener thread to shut down");
-	stopServer();
-	writeln("waiting for listener to finish");
-	receiveOnly!Tid();
-	writeln("exiting");
-}
 
 void listen(ServerSettings settings, Tid parentTid) {
 	writeln("listen: handlers.length: ", dynamicHttpHandlers.length);
