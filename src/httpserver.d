@@ -11,7 +11,6 @@ import std.digest.sha;
 import std.file;
 import std.stdio;
 import std.string;
-import std.traits;
 
 struct ServerSettings {
 	ushort port = 8080;
@@ -161,11 +160,7 @@ abstract class HttpHandler {
 
 private:
 	Regex!char _regexp;
-	ReturnType!matchText _matcher;
-
-	auto matchText(string text) {
-		return match(text, _regexp);
-	}
+	typeof(match(string.init, Regex!char.init)) _matcher;
 }
 
 abstract class Protocol {
@@ -299,7 +294,7 @@ class HttpProtocol : Protocol {
 			foreach (shandler; staticHttpHandlers) {
 				writeln("trying static handler");
 				StaticHttpHandler handler = cast(StaticHttpHandler) shandler;
-				handler._matcher = handler.matchText(request._path);
+				handler._matcher = match(request._path, handler._regexp);
 				if (handler._matcher) {
 					response = handler._response;
 					break;
@@ -309,7 +304,7 @@ class HttpProtocol : Protocol {
 				foreach (shandler; dynamicHttpHandlers) {
 					writeln("trying dynamic handler");
 					DynamicHttpHandler handler = cast(DynamicHttpHandler) shandler;
-					handler._matcher = handler.matchText(request._path);
+					handler._matcher = match(request._path, handler._regexp);
 					if (handler._matcher) {
 						response = handler.handle(request, remoteAddress).toBytes();
 						break;
