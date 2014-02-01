@@ -1,4 +1,4 @@
-module exent.httpserver;
+module dhsl.httpserver;
 
 public import std.regex;
 public import std.socket;

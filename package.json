@@ -1,0 +1,15 @@
+{
+    "name": "DHSL",
+    "targetName": "DHSL",
+    "targetType": "library",
+    "sourcePath": "source",
+    "importPaths": [ "source"],    
+    "license": "unknown",
+    "description": "D HTTP Server Library",
+
+    "authors": [
+        "Vidar Wahlberg"
+    ]
+}
+
+
