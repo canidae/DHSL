@@ -15,7 +15,7 @@ import std.string;
 struct ServerSettings {
 	ushort port = 8080;
 	int maxConnections = 2;
-	long maxRequestSize = 52428800;
+	ptrdiff_t maxRequestSize = 52428800;
 	int connectionTimeoutMs = 180000;
 	int bufferSize = 4096;
 	int maxNewConnectionsFromHostPerSec = 3; // TODO: actually use this value
@@ -174,12 +174,12 @@ abstract class Protocol {
 }
 
 class HttpProtocol : Protocol {
-	immutable webSocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+	static immutable webSocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 	static httpRequestStartLineRegexp = ctRegex!r"^([^ ]+) ([^ \?]+)\??([^ ]*) HTTP.*$";
 	ubyte[] buffer;
 	bool headersParsed;
-	long contentStart;
-	long contentLength;
+	ptrdiff_t contentStart;
+	ptrdiff_t contentLength;
 	HttpRequest request;
 
 	this(Connection connection) {
@@ -189,7 +189,7 @@ class HttpProtocol : Protocol {
 	override bool parseData(ubyte[] data, Address remoteAddress) {
 		buffer ~= data;
 		if (!headersParsed) {
-			long pos = indexOf(cast(string) buffer, cast(string) [13, 10]);
+			ptrdiff_t pos = indexOf(cast(string) buffer, cast(string) [13, 10]);
 			if (pos == -1) {
 				writeln("<CR><LF> not found in first packet, presumably broken HTTP request");
 				return false;
@@ -203,7 +203,7 @@ class HttpProtocol : Protocol {
 			request._method = to!string(matcher.captures[1]);
 			request._path = to!string(matcher.captures[2])[1 .. $]; // chop first /
 			request._query = to!string(matcher.captures[3]);
-			long headerStart = pos + 2;
+			ptrdiff_t headerStart = pos + 2;
 			pos = indexOf(cast(string) buffer[headerStart .. $], cast(string) [13, 10, 13, 10]);
 			if (pos == -1) {
 				if (buffer.length >= serverSettings.maxHttpHeaderSize) {
@@ -222,7 +222,7 @@ class HttpProtocol : Protocol {
 			string webSocketKey;
 			bool hasWebSocketVersion;
 			foreach (string header; splitLines(headerText)) {
-				long colon = indexOf(header, ':');
+				ptrdiff_t colon = indexOf(header, ':');
 				if (colon > 0 && colon < header.length - 1) {
 					string key = toLower(strip(header[0 .. colon]));
 					string value = strip(header[colon + 1 .. $]);
@@ -253,7 +253,7 @@ class HttpProtocol : Protocol {
 						break;
 
 					case "content-length":
-						contentLength = to!long(value);
+						contentLength = to!ptrdiff_t(value);
 						if (contentLength > serverSettings.maxRequestSize)
 							return false;
 						break;
@@ -337,7 +337,7 @@ class WebSocketProtocol : Protocol {
 	PacketType packetType;
 	ubyte[] buffer;
 	bool newFrame;
-	long length;
+	ptrdiff_t length;
 	ubyte[] mask;
 
 	this(Connection connection) {
