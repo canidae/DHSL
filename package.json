@@ -1,6 +1,6 @@
 {
-    "name": "DHSL",
-    "targetName": "DHSL",
+    "name": "dhsl",
+    "targetName": "dhsl",
     "targetType": "library",
     "sourcePath": "source",
     "importPaths": [ "source"],    
