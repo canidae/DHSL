@@ -130,7 +130,7 @@ private:
 }
 
 void addDynamicHandler(DynamicHttpHandler httpHandler) {
-	writeln("adding handler: ", httpHandler);
+	//writeln("adding handler: ", httpHandler);
 	dynamicHttpHandlers ~= cast(shared) httpHandler;
 }
 
@@ -289,10 +289,10 @@ class HttpProtocol : Protocol {
 		if (contentLength >= buffer.length - contentStart) {
 			request._content = buffer[contentStart .. contentStart + contentLength];
 			buffer = buffer[contentStart + contentLength .. $];
-			writeln("looking for handler matching path: ", request._path);
+			//writeln("looking for handler matching path: ", request._path);
 			ubyte[] response;
 			foreach (shandler; staticHttpHandlers) {
-				writeln("trying static handler");
+				//writeln("trying static handler");
 				StaticHttpHandler handler = cast(StaticHttpHandler) shandler;
 				handler._matcher = match(request._path, handler._regexp);
 				if (handler._matcher) {
@@ -302,7 +302,7 @@ class HttpProtocol : Protocol {
 			}
 			if (response.length == 0) {
 				foreach (shandler; dynamicHttpHandlers) {
-					writeln("trying dynamic handler");
+					//writeln("trying dynamic handler");
 					DynamicHttpHandler handler = cast(DynamicHttpHandler) shandler;
 					handler._matcher = match(request._path, handler._regexp);
 					if (handler._matcher) {
@@ -473,7 +473,7 @@ shared DynamicHttpHandler[] dynamicHttpHandlers;
 Tid listenerThread;
 
 void listen(ServerSettings settings, Tid parentTid) {
-	writeln("listen: handlers.length: ", dynamicHttpHandlers.length);
+	//writeln("listen: handlers.length: ", dynamicHttpHandlers.length);
 	serverSettings = settings;
 	Socket listener = new TcpSocket;
 	scope (exit) {
