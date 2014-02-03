@@ -121,6 +121,10 @@ private:
 		ubyte[] response = cast(ubyte[]) ("HTTP/1.1 " ~ to!string(status) ~ " " ~ to!string(status) ~ "\r\n");
 		if (content.length > 0)
 			_headers["content-length"] = to!string(content.length);
+
+        // always close connection, else HTTP 1.1 client with Keep-Alive support will wait for something
+        _headers["Connection"] = "close";
+
 		foreach (key, value; _headers)
 			response ~= cast(ubyte[]) (key ~ ": " ~ value ~ "\r\n");
 		response ~= cast(ubyte[]) "\r\n";
