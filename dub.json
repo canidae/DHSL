@@ -1,0 +1,13 @@
+{
+  "name": "dhsl",
+  "description": "D HTTP Server Library",
+  "license": "MIT",
+  "authors": [
+    "Vidar Wahlberg"
+  ],
+
+  "subPackages": [
+    "examples/demo"
+  ]
+}
+

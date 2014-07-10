@@ -1,0 +1,13 @@
+{
+  "name": "demo",
+  "description": "D HTTP Server Demo",
+  "license": "MIT",
+  "authors": [
+    "Vidar Wahlberg"
+  ],
+
+  "dependencies": {
+    "dhsl": {"path": "../../", "version": "~master"}
+  }
+}
+
