@@ -2,7 +2,7 @@ import dhsl;
 import std.stdio;
 
 void main() {
-	addDynamicHandler(new DynamicFileHttpHandler("src/httpserver.d"));
+	addDynamicHandler(new DynamicFileHttpHandler("source/dhsl/httpserver.d"));
 	writeln("spawning listener thread");
 	startServer(ServerSettings());
 	writeln("sleeping 10 seconds");
