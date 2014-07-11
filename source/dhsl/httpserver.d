@@ -15,7 +15,7 @@ import std.string;
 struct ServerSettings {
 	ushort port = 8080;
 	int maxConnections = 2;
-	ptrdiff_t maxRequestSize = 52428800;
+	size_t maxRequestSize = 52428800;
 	int connectionTimeoutMs = 180000;
 	int bufferSize = 4096;
 	int maxNewConnectionsFromHostPerSec = 3; // TODO: actually use this value
@@ -182,8 +182,8 @@ class HttpProtocol : Protocol {
 	static httpRequestStartLineRegexp = ctRegex!r"^([^ ]+) ([^ \?]+)\??([^ ]*) HTTP.*$";
 	ubyte[] buffer;
 	bool headersParsed;
-	ptrdiff_t contentStart;
-	ptrdiff_t contentLength;
+	size_t contentStart;
+	size_t contentLength;
 	HttpRequest request;
 
 	this(Connection connection) {
@@ -193,7 +193,7 @@ class HttpProtocol : Protocol {
 	override bool parseData(ubyte[] data, Address remoteAddress) {
 		buffer ~= data;
 		if (!headersParsed) {
-			ptrdiff_t pos = indexOf(cast(string) buffer, cast(string) [13, 10]);
+			size_t pos = indexOf(cast(string) buffer, cast(string) [13, 10]);
 			if (pos == -1) {
 				writeln("<CR><LF> not found in first packet, presumably broken HTTP request");
 				return false;
@@ -207,7 +207,7 @@ class HttpProtocol : Protocol {
 			request._method = to!string(matcher.captures[1]);
 			request._path = to!string(matcher.captures[2])[1 .. $]; // chop first /
 			request._query = to!string(matcher.captures[3]);
-			ptrdiff_t headerStart = pos + 2;
+			size_t headerStart = pos + 2;
 			pos = indexOf(cast(string) buffer[headerStart .. $], cast(string) [13, 10, 13, 10]);
 			if (pos == -1) {
 				if (buffer.length >= serverSettings.maxHttpHeaderSize) {
@@ -226,7 +226,7 @@ class HttpProtocol : Protocol {
 			string webSocketKey;
 			bool hasWebSocketVersion;
 			foreach (string header; splitLines(headerText)) {
-				ptrdiff_t colon = indexOf(header, ':');
+				size_t colon = indexOf(header, ':');
 				if (colon > 0 && colon < header.length - 1) {
 					string key = toLower(strip(header[0 .. colon]));
 					string value = strip(header[colon + 1 .. $]);
@@ -257,7 +257,7 @@ class HttpProtocol : Protocol {
 						break;
 
 					case "content-length":
-						contentLength = to!ptrdiff_t(value);
+						contentLength = to!size_t(value);
 						if (contentLength > serverSettings.maxRequestSize)
 							return false;
 						break;
@@ -341,7 +341,7 @@ class WebSocketProtocol : Protocol {
 	PacketType packetType;
 	ubyte[] buffer;
 	bool newFrame;
-	ptrdiff_t length;
+	size_t length;
 	ubyte[] mask;
 
 	this(Connection connection) {
@@ -423,7 +423,7 @@ class Connection {
 	bool read() {
 		ubyte[] buffer;
 		buffer.length = serverSettings.bufferSize;
-		ptrdiff_t read;
+		size_t read;
 		bool isAlive;
 		synchronized (socket) {
 			read = socket.receive(buffer);
@@ -446,7 +446,7 @@ class Connection {
 	/* returns true if connection is to be kept alive, false if it's to be closed */
 	bool write() {
 		while (output.length > 0) {
-			ptrdiff_t sent;
+			size_t sent;
 			synchronized (socket) {
 				sent = socket.send(output[0]);
 			}
