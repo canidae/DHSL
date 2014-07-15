@@ -1,3 +1,5 @@
 *.swp
 *.o
-dhsl
+.dub
+libdhsl.a
+dhsl_demo
