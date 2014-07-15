@@ -24,26 +24,28 @@ struct ServerSettings {
     // TODO: gzip compression, see std.zlib
 }
 
-abstract class DynamicHttpHandler : HttpHandler {
+abstract class HttpHandler {
+    @property auto regexp() {
+        return _regexp;
+    }
+
+    @property auto matcher() {
+        return _matcher;
+    }
+
     this(Regex!char regexp) {
-        super(regexp);
+        _regexp = regexp;
     }
 
     HttpResponse handle(HttpRequest request, Address remote);
-}
-
-abstract class StaticHttpHandler : HttpHandler {
-    this(Regex!char regexp, HttpResponse response) {
-        super(regexp);
-        _response = response.toBytes();
-    }
 
 private:
-    ubyte[] _response;
+    Regex!char _regexp;
+    typeof(match(string.init, Regex!char.init)) _matcher;
 }
 
 /* TODO: this really isn't a part of the library, should be removed */
-class DynamicFileHttpHandler : DynamicHttpHandler {
+class DynamicFileHttpHandler : HttpHandler {
     this(string path) {
         super(regex(path));
         _path = path;
@@ -137,9 +139,9 @@ private:
     }
 }
 
-void addDynamicHandler(DynamicHttpHandler httpHandler) {
-    //writeln("adding handler: ", httpHandler);
-    dynamicHttpHandlers ~= cast(shared) httpHandler;
+void addHttpHandler(HttpHandler httpHandler) {
+    writeln("adding handler: ", httpHandler);
+    httpHandlers ~= httpHandler;
 }
 
 void startServer(ServerSettings settings) {
@@ -153,24 +155,6 @@ void stopServer() {
 
 /* stuff below this line is not that interesting for users */
 private:
-abstract class HttpHandler {
-    @property auto regexp() {
-        return _regexp;
-    }
-
-    @property auto matcher() {
-        return _matcher;
-    }
-
-    this(Regex!char regexp) {
-        _regexp = regexp;
-    }
-
-private:
-    Regex!char _regexp;
-    typeof(match(string.init, Regex!char.init)) _matcher;
-}
-
 abstract class Protocol {
     Connection connection;
 
@@ -297,28 +281,17 @@ class HttpProtocol : Protocol {
         if (contentLength >= buffer.length - contentStart) {
             request._content = buffer[contentStart .. contentStart + contentLength];
             buffer = buffer[contentStart + contentLength .. $];
-            //writeln("looking for handler matching path: ", request._path);
+            writeln("looking for handler matching path: ", request._path);
             ubyte[] response;
-            foreach (shandler; staticHttpHandlers) {
-                //writeln("trying static handler");
-                StaticHttpHandler handler = cast(StaticHttpHandler) shandler;
+            foreach (handler; httpHandlers) {
+                writeln("Testing handler: " ~ to!string(handler._regexp));
                 handler._matcher = match(request._path, handler._regexp);
                 if (handler._matcher) {
-                    response = handler._response;
+                    response = handler.handle(request, remoteAddress).toBytes();
                     break;
                 }
             }
-            if (response.length == 0) {
-                foreach (shandler; dynamicHttpHandlers) {
-                    //writeln("trying dynamic handler");
-                    DynamicHttpHandler handler = cast(DynamicHttpHandler) shandler;
-                    handler._matcher = match(request._path, handler._regexp);
-                    if (handler._matcher) {
-                        response = handler.handle(request, remoteAddress).toBytes();
-                        break;
-                    }
-                }
-            }
+            writeln("no?");
             if (response.length == 0) {
                 HttpResponse httpResponse;
                 httpResponse.status = 404;
@@ -475,13 +448,12 @@ class Connection {
 }
 
 ServerSettings serverSettings;
-shared StaticHttpHandler[] staticHttpHandlers;
-shared DynamicHttpHandler[] dynamicHttpHandlers;
+HttpHandler[] httpHandlers;
 //shared WebSocketHandler webSocketHandler;
 Tid listenerThread;
 
 void listen(ServerSettings settings, Tid parentTid) {
-    //writeln("listen: handlers.length: ", dynamicHttpHandlers.length);
+    //writeln("listen: handlers.length: ", httpHandlers.length);
     serverSettings = settings;
     Socket listener = new TcpSocket;
     scope (exit) {
