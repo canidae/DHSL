@@ -8,7 +8,6 @@ import std.concurrency;
 import std.conv;
 import std.datetime;
 import std.digest.sha;
-import std.file;
 import std.stdio;
 import std.string;
 
@@ -24,43 +23,16 @@ struct ServerSettings {
     // TODO: gzip compression, see std.zlib
 }
 
-abstract class DynamicHttpHandler : HttpHandler {
+abstract class HttpHandler {
     this(Regex!char regexp) {
-        super(regexp);
+        _regexp = regexp;
     }
 
     HttpResponse handle(HttpRequest request, Address remote);
-}
-
-abstract class StaticHttpHandler : HttpHandler {
-    this(Regex!char regexp, HttpResponse response) {
-        super(regexp);
-        _response = response.toBytes();
-    }
 
 private:
-    ubyte[] _response;
-}
-
-/* TODO: this really isn't a part of the library, should be removed */
-class DynamicFileHttpHandler : DynamicHttpHandler {
-    this(string path) {
-        super(regex(path));
-        _path = path;
-    }
-
-    override HttpResponse handle(HttpRequest request, Address remote) {
-        HttpResponse response;
-        try {
-            response.content = cast(ubyte[]) readText(_path);
-        } catch (Throwable t) {
-            writeln(t);
-        }
-        return response;
-    }
-
-private:
-    string _path;
+    Regex!char _regexp;
+    typeof(match(string.init, Regex!char.init)) _matcher;
 }
 
 struct HttpRequest {
@@ -122,7 +94,8 @@ private:
     string[string] _headers;
 
     ubyte[] toBytes() {
-        ubyte[] response = cast(ubyte[]) ("HTTP/1.1 " ~ to!string(status) ~ " " ~ to!string(status) ~ "\r\n");
+        string statusString = to!string(status);
+        ubyte[] response = cast(ubyte[]) ("HTTP/1.1 " ~ statusString ~ " " ~ statusString ~ "\r\n");
         if (content.length > 0)
             _headers["content-length"] = to!string(content.length);
 
@@ -137,9 +110,9 @@ private:
     }
 }
 
-void addDynamicHandler(DynamicHttpHandler httpHandler) {
+void addHttpHandler(HttpHandler httpHandler) {
     //writeln("adding handler: ", httpHandler);
-    dynamicHttpHandlers ~= cast(shared) httpHandler;
+    httpHandlers ~= cast(shared) httpHandler;
 }
 
 void startServer(ServerSettings settings) {
@@ -153,24 +126,6 @@ void stopServer() {
 
 /* stuff below this line is not that interesting for users */
 private:
-abstract class HttpHandler {
-    @property auto regexp() {
-        return _regexp;
-    }
-
-    @property auto matcher() {
-        return _matcher;
-    }
-
-    this(Regex!char regexp) {
-        _regexp = regexp;
-    }
-
-private:
-    Regex!char _regexp;
-    typeof(match(string.init, Regex!char.init)) _matcher;
-}
-
 abstract class Protocol {
     Connection connection;
 
@@ -291,7 +246,7 @@ class HttpProtocol : Protocol {
                 response.setHeader("Sec-WebSocket-Accept", webSocketAccept);
                 connection.send(response.toBytes());
                 connection.changeProtocol(new WebSocketProtocol(connection));
-                return true; // no longer a HTTP protocol
+                return true; // no longer HTTP
             }
         }
         if (contentLength >= buffer.length - contentStart) {
@@ -299,19 +254,10 @@ class HttpProtocol : Protocol {
             buffer = buffer[contentStart + contentLength .. $];
             //writeln("looking for handler matching path: ", request._path);
             ubyte[] response;
-            foreach (shandler; staticHttpHandlers) {
-                //writeln("trying static handler");
-                StaticHttpHandler handler = cast(StaticHttpHandler) shandler;
-                handler._matcher = match(request._path, handler._regexp);
-                if (handler._matcher) {
-                    response = handler._response;
-                    break;
-                }
-            }
             if (response.length == 0) {
-                foreach (shandler; dynamicHttpHandlers) {
+                foreach (httpHandler; httpHandlers) {
                     //writeln("trying dynamic handler");
-                    DynamicHttpHandler handler = cast(DynamicHttpHandler) shandler;
+                    HttpHandler handler = cast(HttpHandler) httpHandler;
                     handler._matcher = match(request._path, handler._regexp);
                     if (handler._matcher) {
                         response = handler.handle(request, remoteAddress).toBytes();
@@ -475,13 +421,12 @@ class Connection {
 }
 
 ServerSettings serverSettings;
-shared StaticHttpHandler[] staticHttpHandlers;
-shared DynamicHttpHandler[] dynamicHttpHandlers;
+shared HttpHandler[] httpHandlers;
 //shared WebSocketHandler webSocketHandler;
 Tid listenerThread;
 
 void listen(ServerSettings settings, Tid parentTid) {
-    //writeln("listen: handlers.length: ", dynamicHttpHandlers.length);
+    //writeln("listen: handlers.length: ", httpHandlers.length);
     serverSettings = settings;
     Socket listener = new TcpSocket;
     scope (exit) {
