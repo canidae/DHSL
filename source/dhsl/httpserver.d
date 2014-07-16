@@ -275,7 +275,7 @@ class HttpProtocol : Protocol {
                 response.setHeader("Sec-WebSocket-Accept", webSocketAccept);
                 connection.send(response.toBytes());
                 connection.changeProtocol(new WebSocketProtocol(connection));
-                return true; // no longer a HTTP protocol
+                return true; // no longer a HTTP
             }
         }
         if (contentLength >= buffer.length - contentStart) {
@@ -513,4 +513,114 @@ void handleConnection(shared Socket ssocket, Tid parentTid) {
         });
     }
     writefln("Closing connection with %s", connection.remoteAddress.toString());
+}
+
+// another attempt, not spawning threads per connection (but keeping a fixed amount of workers)
+struct ClientData {
+    SysTime connected;
+    ubyte[] readBuffer;
+    ubyte[] writeBuffer;
+}
+
+void listen2(ServerSettings settings, Tid parentTid) {
+    //writeln("listen: handlers.length: ", httpHandlers.length);
+    serverSettings = settings;
+    Socket listener = new TcpSocket;
+    scope (exit) {
+        listener.shutdown(SocketShutdown.BOTH);
+        listener.close();
+        send(parentTid, thisTid);
+    }
+    listener.blocking = true;
+    listener.bind(new InternetAddress(settings.port));
+    listener.listen(settings.connectionQueueSize); // TODO: may fail if port is not available. also: we're currently not closing the port properly upon exiting, find out why
+    listener.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, dur!"msecs"(1000)); // don't block for more than a second at a time
+    writeln("Listening on port ", settings.port);
+
+    ClientData[Socket] clients;
+
+    SysTime[Tid] threads;
+    bool active = true;
+    while (active) {
+        auto writeSet = new SocketSet();
+        foreach (socket; clients.keys)
+            writeSet.add(socket);
+        auto errorSet = writeSet.dup;
+        auto readSet = writeSet.dup;
+        readSet.add(listener);
+        if (Socket.select(readSet, writeSet, errorSet, dur!"msecs"(1000)) > 0) {
+            foreach (socket; readSet) {
+                if (socket == listener) {
+                    // new connection
+                    clients[socket.accept()] = ClientData(Clock.currTime);
+                } else {
+                    ubyte[] buffer;
+                    buffer.length = settings.bufferSize;
+                    size_t received = socket.receive(buffer);
+                    if (received > 0) {
+                        clients[socket].readBuffer ~= buffer;
+                        // TODO: pass readBuffer to handleRequest()
+                    } else {
+                        // connection remotely closed
+                        // TODO
+                    }
+                }
+            }
+            foreach (socket; writeSocket) {
+                // TODO: write to socket
+            }
+            foreach (socket; errorSocket) {
+                // TODO: close socket?
+            }
+        }
+
+        bool messages = true;
+        while (messages) {
+            messages = receiveTimeout(dur!"msecs"(0), (Tid tid) {
+                if (tid == parentTid)
+                    active = false; // server shutdown requested
+                else
+                    threads.remove(tid); // socket is no longer active, remove it
+            });
+        }
+        if (threads.length > serverSettings.maxConnections) {
+            /* TODO: remove oldest last active connection(?) */
+            /* with ping-ponging websocket then "last active connection" will be completely arbitrary, though */
+        }
+    }
+    foreach (tid, activity; threads)
+        send(tid, thisTid);
+    while (threads.length > 0) {
+        receive((Tid tid) {
+            threads.remove(tid); // socket is no longer active, remove it
+        });
+    }
+}
+
+void handleRequest(Tid parentTid) {
+    bool active = true;
+    while (active) {
+        void requestHandler(ubyte[] buffer) {
+        }
+        ubyte[] buffer;
+        buffer.length = serverSettings.bufferSize;
+        size_t read;
+        bool isAlive;
+        synchronized (socket) {
+            read = socket.receive(buffer);
+            isAlive = socket.isAlive();
+        }
+        if (read > 0) {
+            writeln("Read: ", cast(string) buffer[0 .. read]);
+            return protocol.parseData(buffer[0 .. read], remoteAddress);
+        } else if (read == 0) {
+            // connection closed
+            return false;
+        } else if (read == Socket.ERROR && !isAlive) {
+            // connection error
+            writefln("Connection error with %s", remoteAddress.toString());
+            return false;
+        }
+        return isAlive;
+    }
 }
