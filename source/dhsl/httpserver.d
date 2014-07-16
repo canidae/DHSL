@@ -23,16 +23,8 @@ struct ServerSettings {
     // TODO: gzip compression, see std.zlib
 }
 
-abstract class HttpHandler {
-    this(Regex!char regexp) {
-        _regexp = regexp;
-    }
-
+interface HttpHandler {
     HttpResponse handle(HttpRequest request, Address remote);
-
-private:
-    Regex!char _regexp;
-    typeof(match(string.init, Regex!char.init)) _matcher;
 }
 
 struct HttpRequest {
@@ -65,8 +57,8 @@ private:
 }
 
 struct HttpResponse {
-    int status = 200;
     ubyte[] content;
+    int status = 200;
 
     @property string[string] headers() {
         return _headers;
@@ -110,22 +102,30 @@ private:
     }
 }
 
-void addHttpHandler(HttpHandler httpHandler) {
+void addHttpHandler(string regexp, HttpHandler httpHandler) {
     //writeln("adding handler: ", httpHandler);
-    httpHandlers ~= cast(shared) httpHandler;
+    httpHandlers[regex("^" ~ regexp ~ "$")] = cast(shared) httpHandler;
 }
 
 void startServer(ServerSettings settings) {
-    listenerThread = spawn(&listen, settings, thisTid);
+    if (listenerThread == Tid())
+        listenerThread = spawn(&listen, settings, thisTid);
 }
 
 void stopServer() {
-    send(listenerThread, thisTid);
-    receiveOnly!Tid();
+    if (listenerThread != Tid()) {
+        send(listenerThread, thisTid);
+        receiveOnly!Tid();
+    }
 }
 
 /* stuff below this line is not that interesting for users */
 private:
+ServerSettings serverSettings;
+shared HttpHandler[Regex!char] httpHandlers;
+//shared WebSocketHandler webSocketHandler;
+Tid listenerThread;
+
 abstract class Protocol {
     Connection connection;
 
@@ -138,7 +138,7 @@ abstract class Protocol {
 
 class HttpProtocol : Protocol {
     static immutable webSocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    static httpRequestStartLineRegexp = ctRegex!r"^([^ ]+) ([^ \?]+)\??([^ ]*) HTTP.*$";
+    static httpRequestStartLineRegexp = ctRegex!(r"^([^ ]+) ([^ \?]+)\??([^ ]*) HTTP.*$");
     ubyte[] buffer;
     bool headersParsed;
     size_t contentStart;
@@ -255,11 +255,9 @@ class HttpProtocol : Protocol {
             //writeln("looking for handler matching path: ", request._path);
             ubyte[] response;
             if (response.length == 0) {
-                foreach (httpHandler; httpHandlers) {
-                    //writeln("trying dynamic handler");
+                foreach (regexp, httpHandler; httpHandlers) {
                     HttpHandler handler = cast(HttpHandler) httpHandler;
-                    handler._matcher = match(request._path, handler._regexp);
-                    if (handler._matcher) {
+                    if (!match(request._path, regexp).empty()) {
                         response = handler.handle(request, remoteAddress).toBytes();
                         break;
                     }
@@ -380,7 +378,7 @@ class Connection {
             isAlive = socket.isAlive();
         }
         if (read > 0) {
-            writeln("Read: ", cast(string) buffer[0 .. read]);
+            //writeln("Read: ", cast(string) buffer[0 .. read]);
             return protocol.parseData(buffer[0 .. read], remoteAddress);
         } else if (read == 0) {
             // connection closed
@@ -419,11 +417,6 @@ class Connection {
         socket.close();
     }
 }
-
-ServerSettings serverSettings;
-shared HttpHandler[] httpHandlers;
-//shared WebSocketHandler webSocketHandler;
-Tid listenerThread;
 
 void listen(ServerSettings settings, Tid parentTid) {
     //writeln("listen: handlers.length: ", httpHandlers.length);
