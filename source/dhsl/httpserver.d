@@ -8,6 +8,7 @@ import std.concurrency;
 import std.conv;
 import std.datetime;
 import std.digest.sha;
+import std.random;
 import std.stdio;
 import std.string;
 
@@ -28,6 +29,10 @@ interface HttpHandler {
 }
 
 struct HttpRequest {
+    @property string protocol() {
+        return _protocol;
+    }
+
     @property string method() {
         return _method;
     }
@@ -49,6 +54,7 @@ struct HttpRequest {
     }
 
 private:
+    string _protocol;
     string _method;
     string _path;
     string _query;
@@ -92,7 +98,7 @@ private:
             _headers["content-length"] = to!string(content.length);
 
         // always close connection, else HTTP 1.1 client with Keep-Alive support will wait for something
-        _headers["Connection"] = "close";
+        _headers["connection"] = "close";
 
         foreach (key, value; _headers)
             response ~= cast(ubyte[]) (key ~ ": " ~ value ~ "\r\n");
@@ -126,6 +132,23 @@ shared HttpHandler[Regex!char] httpHandlers;
 //shared WebSocketHandler webSocketHandler;
 Tid listenerThread;
 
+//version (DdosProtection) {
+    struct ClientStatus {
+        uint verification;
+        bool banned;
+
+        static ClientStatus opCall() {
+            // default constructor is not allowed for structs in D
+            ClientStatus cs;
+            cs.verification = uniform(1, typeof(verification).max);
+            cs.banned = false;
+            return cs;
+        }
+    }
+
+    shared ClientStatus[string] clientStatuses;
+//}
+
 abstract class Protocol {
     Connection connection;
 
@@ -138,7 +161,7 @@ abstract class Protocol {
 
 class HttpProtocol : Protocol {
     static immutable webSocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    static httpRequestStartLineRegexp = ctRegex!(r"^([^ ]+) ([^ \?]+)\??([^ ]*) HTTP.*$");
+    static httpRequestStartLineRegexp = ctRegex!(r"^([^ ]+) ([^ \?]+)\??([^ ]*) (HTTP.*)$");
     ubyte[] buffer;
     bool headersParsed;
     size_t contentStart;
@@ -164,8 +187,9 @@ class HttpProtocol : Protocol {
             }
             string startLine = cast(string) buffer[0 .. pos];
             request._method = to!string(matcher.captures[1]);
-            request._path = to!string(matcher.captures[2])[1 .. $]; // chop first /
+            request._path = to!string(matcher.captures[2]);
             request._query = to!string(matcher.captures[3]);
+            request._protocol = to!string(matcher.captures[4]);
             size_t headerStart = pos + 2;
             pos = indexOf(cast(string) buffer[headerStart .. $], cast(string) [13, 10, 13, 10]);
             if (pos == -1) {
@@ -252,8 +276,44 @@ class HttpProtocol : Protocol {
         if (contentLength >= buffer.length - contentStart) {
             request._content = buffer[contentStart .. contentStart + contentLength];
             buffer = buffer[contentStart + contentLength .. $];
-            //writeln("looking for handler matching path: ", request._path);
             ubyte[] response;
+            //version (DdosProtection) {
+                // simple DDOS protection. basically, redirect client to a special page with an id in url, if id match what we've stored for ip, we'll let the user in
+                // TODO: what if an attacker sends in lots of different IPs, making us use lots of memory? how long time should we give people to verify?
+                // TODO: if excessive requests are done for one IP, we'll have to forget verification and have client reverify
+                string remoteIpAddress = remoteAddress.toAddrString();
+                ClientStatus clientStatus = (remoteIpAddress in clientStatuses) ? cast(ClientStatus) clientStatuses[remoteIpAddress] : ClientStatus();
+                if (indexOf(request.path, "/__verify__/") == 0) {
+                    // client verifying its authenticity
+                    auto firstDelim = indexOf(request.path, "/", 1) + 1;
+                    auto secondDelim = indexOf(request.path, "/", firstDelim);
+                    uint verification = to!uint(request.path[firstDelim .. secondDelim]);
+                    writefln("Client trying to verify authenticity, expected verification code is %s, received %s", clientStatus.verification, verification);
+                    if (verification == clientStatus.verification) {
+                        writeln("Client successfully verified its authenticity");
+                        clientStatus.verification = 0; // client authenticity is now verified
+                        // redirect client back again
+                        HttpResponse httpResponse;
+                        httpResponse.status = 307;
+                        httpResponse.setHeader("Location", toLower(request.protocol[0 .. indexOf(request.protocol, "/")]) ~ "://" ~ request.headers["host"] ~ request.path[secondDelim .. $]);
+                        httpResponse.content = cast(ubyte[]) "DDOS protection testing";
+                        writeln(cast(string) (httpResponse.toBytes()));
+                        response = httpResponse.toBytes();
+                    }
+                }
+                clientStatuses[remoteIpAddress] = clientStatus;
+                if (clientStatus.verification != 0) {
+                    // client needs to verify its authenticity
+                    writefln("Client needs to verify its authenticity by replying with verification code: %s", clientStatus.verification);
+                    HttpResponse httpResponse;
+                    httpResponse.status = 307;
+                    httpResponse.setHeader("Location", toLower(request.protocol[0 .. indexOf(request.protocol, "/")]) ~ "://" ~ request.headers["host"] ~ "/__verify__/" ~ to!string(clientStatus.verification) ~ request.path);
+                    httpResponse.content = cast(ubyte[]) "DDOS protection testing";
+                    writeln(cast(string) (httpResponse.toBytes()));
+                    response = httpResponse.toBytes();
+                }
+            //}
+            //writeln("looking for handler matching path: ", request._path);
             if (response.length == 0) {
                 foreach (regexp, httpHandler; httpHandlers) {
                     HttpHandler handler = cast(HttpHandler) httpHandler;
@@ -378,7 +438,7 @@ class Connection {
             isAlive = socket.isAlive();
         }
         if (read > 0) {
-            //writeln("Read: ", cast(string) buffer[0 .. read]);
+            writeln("Read:\n", cast(string) buffer[0 .. read]);
             return protocol.parseData(buffer[0 .. read], remoteAddress);
         } else if (read == 0) {
             // connection closed
