@@ -133,18 +133,39 @@ shared HttpHandler[Regex!char] httpHandlers;
 Tid listenerThread;
 
 version (DdosProtection) {
+    // DDOS protection?
+    // a common DDOS strategy is to spoof IP address and request pages with heavy load time.
+    //
+    // a simplistic protection against this is to:
+    // - redirect client to a path that includes a "key" (in this case a random integer value). clients with spoofed IP address won't follow this redirect
+    // - check that the key match what we've stored for given IP, if it does then we'll allow future requests from that client
+    // - redirect client back to original path
+    // - require client to reverify if excess requests are coming from an IP address
+    //
+    // this protection does come with some costs:
+    // - server will use more memory keeping data about allowed clients
+    // - client must occasionally send multiple requests, but redirect responses are very small in size, and server load is fairly insignificant
+    //
+    // and it adds some challenges:
+    // - if client is transmitting a lot of data, it may have to do it multiple times if client needs to be reverified
     struct ClientStatus {
-        int verification;
+        uint verification;
+        long lastActivity;
+        uint requestCounter;
 
         static ClientStatus opCall() {
-            // default constructor is not allowed for structs in D
+            // custom default constructor is not allowed for structs in D
             ClientStatus cs;
             cs.verification = uniform(1, typeof(verification).max);
             return cs;
         }
     }
 
+    static immutable CLIENT_OK = 0;
+    // clientStatuses is shared, but we'll skip synchronizing access. assuming the worst thing that can happen is requestCounter being wrong (missing some requests), which we can live with
     shared ClientStatus[string] clientStatuses;
+
+    // TODO: thread that cleans up old clientstatuses (check every x second, require reverification of those with more than x requests in that time, reset request counter)
 }
 
 abstract class Protocol {
@@ -276,9 +297,6 @@ class HttpProtocol : Protocol {
             buffer = buffer[contentStart + contentLength .. $];
             ubyte[] response;
             version (DdosProtection) {
-                // simple DDOS protection. basically, redirect client to a special page with an id in url, if id match what we've stored for ip, we'll let the user in
-                // TODO: what if an attacker sends in lots of different IPs, making us use lots of memory? how long time should we give people to verify?
-                // TODO: if excessive requests are done for one IP, we'll have to forget verification and have client reverify
                 string remoteIpAddress = remoteAddress.toAddrString();
                 ClientStatus clientStatus = (remoteIpAddress in clientStatuses) ? cast(ClientStatus) clientStatuses[remoteIpAddress] : ClientStatus();
                 if (indexOf(request.path, "/__verify__/") == 0) {
@@ -297,10 +315,16 @@ class HttpProtocol : Protocol {
                         httpResponse.content = cast(ubyte[]) "DDOS protection testing";
                         writeln(cast(string) (httpResponse.toBytes()));
                         response = httpResponse.toBytes();
+                    } else {
+                        // wrong verification code, just remove "/__verify__/<code>" from path, this will cause a new redirect to be sent to client
+                        request._path = request.path[secondDelim .. $];
                     }
                 }
+                // update client status
+                clientStatus.lastActivity = Clock.currStdTime();
+                ++clientStatus.requestCounter;
                 clientStatuses[remoteIpAddress] = clientStatus;
-                if (clientStatus.verification != 0) {
+                if (clientStatus.verification != CLIENT_OK) {
                     // client needs to verify its authenticity
                     writefln("Client needs to verify its authenticity by replying with verification code: %s", clientStatus.verification);
                     HttpResponse httpResponse;
