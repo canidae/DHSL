@@ -5,6 +5,7 @@
   "authors": [
     "Vidar Wahlberg"
   ],
+  "versions": ["DdosProtection"],
 
   "subPackages": [
     "examples/demo"

@@ -132,22 +132,12 @@ shared HttpHandler[Regex!char] httpHandlers;
 //shared WebSocketHandler webSocketHandler;
 Tid listenerThread;
 
-//version (DdosProtection) {
-    struct ClientStatus {
-        uint verification;
-        bool banned;
+version (DdosProtection) {
+    static immutable CLIENT_OK = 0;
+    static immutable CLIENT_BANNED = -1;
 
-        static ClientStatus opCall() {
-            // default constructor is not allowed for structs in D
-            ClientStatus cs;
-            cs.verification = uniform(1, typeof(verification).max);
-            cs.banned = false;
-            return cs;
-        }
-    }
-
-    shared ClientStatus[string] clientStatuses;
-//}
+    shared int[string] clientStatuses;
+}
 
 abstract class Protocol {
     Connection connection;
@@ -160,7 +150,7 @@ abstract class Protocol {
 }
 
 class HttpProtocol : Protocol {
-    static immutable webSocketMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    static immutable WEB_SOCKET_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     static httpRequestStartLineRegexp = ctRegex!(r"^([^ ]+) ([^ \?]+)\??([^ ]*) (HTTP.*)$");
     ubyte[] buffer;
     bool headersParsed;
@@ -261,7 +251,7 @@ class HttpProtocol : Protocol {
             /* websocket? */
             if (hasConnection && hasOrigin && hasUpgrade && webSocketKey.length > 0 && hasWebSocketVersion) {
                 writeln("Upgrading connection to WebSocket");
-                auto shaHash = sha1Of(webSocketKey ~ webSocketMagic);
+                auto shaHash = sha1Of(webSocketKey ~ WEB_SOCKET_MAGIC);
                 string webSocketAccept = to!string(Base64.encode(shaHash));
                 HttpResponse response;
                 response.status = 101;
@@ -277,21 +267,21 @@ class HttpProtocol : Protocol {
             request._content = buffer[contentStart .. contentStart + contentLength];
             buffer = buffer[contentStart + contentLength .. $];
             ubyte[] response;
-            //version (DdosProtection) {
+            version (DdosProtection) {
                 // simple DDOS protection. basically, redirect client to a special page with an id in url, if id match what we've stored for ip, we'll let the user in
                 // TODO: what if an attacker sends in lots of different IPs, making us use lots of memory? how long time should we give people to verify?
                 // TODO: if excessive requests are done for one IP, we'll have to forget verification and have client reverify
                 string remoteIpAddress = remoteAddress.toAddrString();
-                ClientStatus clientStatus = (remoteIpAddress in clientStatuses) ? cast(ClientStatus) clientStatuses[remoteIpAddress] : ClientStatus();
+                int clientStatus = (remoteIpAddress in clientStatuses) ? cast(int) clientStatuses[remoteIpAddress] : uniform(1, int.max);
                 if (indexOf(request.path, "/__verify__/") == 0) {
                     // client verifying its authenticity
                     auto firstDelim = indexOf(request.path, "/", 1) + 1;
                     auto secondDelim = indexOf(request.path, "/", firstDelim);
                     uint verification = to!uint(request.path[firstDelim .. secondDelim]);
-                    writefln("Client trying to verify authenticity, expected verification code is %s, received %s", clientStatus.verification, verification);
-                    if (verification == clientStatus.verification) {
+                    writefln("Client trying to verify authenticity, expected verification code is %s, received %s", clientStatus, verification);
+                    if (verification == clientStatus) {
                         writeln("Client successfully verified its authenticity");
-                        clientStatus.verification = 0; // client authenticity is now verified
+                        clientStatus = 0; // client authenticity is now verified
                         // redirect client back again
                         HttpResponse httpResponse;
                         httpResponse.status = 307;
@@ -302,17 +292,17 @@ class HttpProtocol : Protocol {
                     }
                 }
                 clientStatuses[remoteIpAddress] = clientStatus;
-                if (clientStatus.verification != 0) {
+                if (clientStatus != CLIENT_OK) {
                     // client needs to verify its authenticity
-                    writefln("Client needs to verify its authenticity by replying with verification code: %s", clientStatus.verification);
+                    writefln("Client needs to verify its authenticity by replying with verification code: %s", clientStatus);
                     HttpResponse httpResponse;
                     httpResponse.status = 307;
-                    httpResponse.setHeader("Location", toLower(request.protocol[0 .. indexOf(request.protocol, "/")]) ~ "://" ~ request.headers["host"] ~ "/__verify__/" ~ to!string(clientStatus.verification) ~ request.path);
+                    httpResponse.setHeader("Location", toLower(request.protocol[0 .. indexOf(request.protocol, "/")]) ~ "://" ~ request.headers["host"] ~ "/__verify__/" ~ to!string(clientStatus) ~ request.path);
                     httpResponse.content = cast(ubyte[]) "DDOS protection testing";
                     writeln(cast(string) (httpResponse.toBytes()));
                     response = httpResponse.toBytes();
                 }
-            //}
+            }
             //writeln("looking for handler matching path: ", request._path);
             if (response.length == 0) {
                 foreach (regexp, httpHandler; httpHandlers) {
