@@ -133,10 +133,18 @@ shared HttpHandler[Regex!char] httpHandlers;
 Tid listenerThread;
 
 version (DdosProtection) {
-    static immutable CLIENT_OK = 0;
-    static immutable CLIENT_BANNED = -1;
+    struct ClientStatus {
+        int verification;
 
-    shared int[string] clientStatuses;
+        static ClientStatus opCall() {
+            // default constructor is not allowed for structs in D
+            ClientStatus cs;
+            cs.verification = uniform(1, typeof(verification).max);
+            return cs;
+        }
+    }
+
+    shared ClientStatus[string] clientStatuses;
 }
 
 abstract class Protocol {
@@ -272,16 +280,16 @@ class HttpProtocol : Protocol {
                 // TODO: what if an attacker sends in lots of different IPs, making us use lots of memory? how long time should we give people to verify?
                 // TODO: if excessive requests are done for one IP, we'll have to forget verification and have client reverify
                 string remoteIpAddress = remoteAddress.toAddrString();
-                int clientStatus = (remoteIpAddress in clientStatuses) ? cast(int) clientStatuses[remoteIpAddress] : uniform(1, int.max);
+                ClientStatus clientStatus = (remoteIpAddress in clientStatuses) ? cast(ClientStatus) clientStatuses[remoteIpAddress] : ClientStatus();
                 if (indexOf(request.path, "/__verify__/") == 0) {
                     // client verifying its authenticity
                     auto firstDelim = indexOf(request.path, "/", 1) + 1;
                     auto secondDelim = indexOf(request.path, "/", firstDelim);
                     uint verification = to!uint(request.path[firstDelim .. secondDelim]);
-                    writefln("Client trying to verify authenticity, expected verification code is %s, received %s", clientStatus, verification);
-                    if (verification == clientStatus) {
+                    writefln("Client trying to verify authenticity, expected verification code is %s, received %s", clientStatus.verification, verification);
+                    if (verification == clientStatus.verification) {
                         writeln("Client successfully verified its authenticity");
-                        clientStatus = 0; // client authenticity is now verified
+                        clientStatus.verification = 0; // client authenticity is now verified
                         // redirect client back again
                         HttpResponse httpResponse;
                         httpResponse.status = 307;
@@ -292,12 +300,12 @@ class HttpProtocol : Protocol {
                     }
                 }
                 clientStatuses[remoteIpAddress] = clientStatus;
-                if (clientStatus != CLIENT_OK) {
+                if (clientStatus.verification != 0) {
                     // client needs to verify its authenticity
-                    writefln("Client needs to verify its authenticity by replying with verification code: %s", clientStatus);
+                    writefln("Client needs to verify its authenticity by replying with verification code: %s", clientStatus.verification);
                     HttpResponse httpResponse;
                     httpResponse.status = 307;
-                    httpResponse.setHeader("Location", toLower(request.protocol[0 .. indexOf(request.protocol, "/")]) ~ "://" ~ request.headers["host"] ~ "/__verify__/" ~ to!string(clientStatus) ~ request.path);
+                    httpResponse.setHeader("Location", toLower(request.protocol[0 .. indexOf(request.protocol, "/")]) ~ "://" ~ request.headers["host"] ~ "/__verify__/" ~ to!string(clientStatus.verification) ~ request.path);
                     httpResponse.content = cast(ubyte[]) "DDOS protection testing";
                     writeln(cast(string) (httpResponse.toBytes()));
                     response = httpResponse.toBytes();
